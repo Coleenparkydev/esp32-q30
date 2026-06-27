@@ -1,0 +1,52 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install arduino-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh -s 0.35.3
+          echo "$PWD/bin" >> $GITHUB_PATH
+
+      - name: Install ESP32 core (pinned)
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.0.7
+
+      - name: Install audio libraries (pinned)
+        run: |
+          LIB=~/Arduino/libraries
+          mkdir -p "$LIB"
+          git clone --depth 1 --branch v1.0.1 https://github.com/pschatzmann/arduino-audio-tools "$LIB/arduino-audio-tools"
+          git clone --depth 1 https://github.com/pschatzmann/ESP32-A2DP        "$LIB/ESP32-A2DP"
+          git clone --depth 1 https://github.com/pschatzmann/arduino-libhelix  "$LIB/arduino-libhelix"
+
+      - name: Compile
+        run: |
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32:PartitionScheme=custom,FlashSize=4M,CPUFreq=240,FlashMode=qio" \
+            --build-property "build.partitions=partitions" \
+            --output-dir ./build \
+            ./esp32-q30-player
+
+      - name: Show app size vs partition
+        run: |
+          ls -lh ./build/*.bin || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: |
+            build/esp32-q30-player.ino.bin
+            build/esp32-q30-player.ino.bootloader.bin
+            build/esp32-q30-player.ino.partitions.bin
