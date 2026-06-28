@@ -31,6 +31,10 @@ jobs:
           git clone --depth 1 https://github.com/pschatzmann/ESP32-A2DP        "$LIB/ESP32-A2DP"
           git clone --depth 1 https://github.com/pschatzmann/arduino-libhelix  "$LIB/arduino-libhelix"
 
+      - name: Install OLED libraries
+        run: |
+          arduino-cli lib install "Adafruit SSD1306" "Adafruit GFX Library" "Adafruit BusIO"
+
       - name: Compile
         run: |
           arduino-cli compile \
