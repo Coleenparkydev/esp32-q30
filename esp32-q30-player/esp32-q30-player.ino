@@ -1,125 +1,83 @@
-#include <WiFi.h>
-#include <WebServer.h>
-#include <LittleFS.h>
+/*
+ * LILYGO LoRa32 (T3 v2.1)  ->  Soundcore Life Q30  (Bluetooth A2DP, SBC)
+ * Multi-song player. Reads ALL .mp3 files from the on-board TF (microSD) slot,
+ * plays them in order, auto-advances to the next song, and loops the whole
+ * playlist forever.
+ *
+ * Songs must be: MP3, 44.1 kHz, stereo (192 kbps is fine).
+ *   - 44.1 kHz is required: the A2DP link sends 44.1 kHz, so any other rate
+ *     (e.g. 48 kHz or 32 kHz) plays at the wrong speed/pitch.
+ *   - stereo is required: mono is interpreted as half-speed and sounds fast.
+ *
+ * No WiFi, no upload step. Put files on the SD card from your PC and power on.
+ *
+ * Libraries (installed by the GitHub Action, pinned):
+ *   - pschatzmann/arduino-audio-tools  (v1.2.5)
+ *   - pschatzmann/ESP32-A2DP
+ *   - pschatzmann/arduino-libhelix
+ *   SD + SPI come with the ESP32 Arduino core.
+ */
 
+#include "SPI.h"
+#include "SD.h"
 #include "AudioTools.h"
 #include "AudioTools/Communication/A2DPStream.h"   // brings in BluetoothA2DPSource
-#include "AudioTools/Disk/AudioSourceLittleFS.h"
+#include "AudioTools/Disk/AudioSourceSD.h"
 #include "AudioTools/AudioCodecs/CodecMP3Helix.h"
 
 // ---------- SETTINGS ----------
-const char* BT_DEVICE_NAME = "Soundcore Life Q30";
-const char* AP_SSID        = "ESP32_Music";
-const char* AP_PASS        = "";
-const char* SONG_PATH      = "/song.mp3";
-const int   BOOT_BUTTON    = 0;
+const char* BT_DEVICE_NAME = "Soundcore Life Q30";  // your headphones' exact BT name
+
+// LILYGO LoRa32 T3 v2.1 TF (microSD) card pins
+#define SD_SCK   14
+#define SD_MISO   2
+#define SD_MOSI  15
+#define SD_CS    13
+// LoRa radio chip-select on this board: drive HIGH so the radio stays
+// deselected and never disturbs anything while we use the SD card.
+#define LORA_CS  18
 // ------------------------------
 
-bool uploadMode = false;
-WebServer server(80);
-File uploadFile;
-
-// playback chain: LittleFS file -> MP3 decode -> queue -> A2DP callback
-AudioSourceLittleFS source("/", "mp3");
+SPIClass sdSPI(HSPI);                                // dedicated SPI bus for the SD card
+AudioSourceSD source("/", ".mp3", SD_CS, sdSPI);     // index every .mp3 in the card root
 MP3DecoderHelix decoder;
 BufferRTOS<uint8_t> a2dpBuffer(0);
 QueueStream<uint8_t> out(a2dpBuffer);
 AudioPlayer player(source, out, decoder);
 BluetoothA2DPSource a2dp;
 
-// A2DP pulls PCM from our buffer
+// A2DP pulls decoded PCM out of our buffer
 int32_t get_data(uint8_t* data, int32_t bytes) {
   return a2dpBuffer.readArray(data, bytes);
 }
 
-// ---------------- UPLOAD MODE ----------------
-const char* PAGE =
-  "<!doctype html><html><head><meta charset='utf-8'>"
-  "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-  "<title>ESP32 Music</title>"
-  "<style>body{font-family:sans-serif;max-width:420px;margin:40px auto;padding:0 16px}"
-  "h2{font-size:1.2rem}button{padding:10px 16px;font-size:1rem}input{margin:12px 0}</style>"
-  "</head><body><h2>ESP32 -> Q30 one-song player</h2>"
-  "<p>Upload one .mp3 (96 kbps, 44.1 kHz, stereo, under ~2 MB). The board saves it, "
-  "reboots, and plays to your Q30.</p>"
-  "<form method='POST' action='/upload' enctype='multipart/form-data'>"
-  "<input type='file' name='song' accept='.mp3' required><br>"
-  "<button type='submit'>Upload &amp; Play</button></form></body></html>";
-
-void handleRoot() { server.send(200, "text/html", PAGE); }
-
-void handleUpload() {
-  HTTPUpload& up = server.upload();
-  if (up.status == UPLOAD_FILE_START) {
-    if (LittleFS.exists(SONG_PATH)) LittleFS.remove(SONG_PATH);
-    uploadFile = LittleFS.open(SONG_PATH, "w");
-  } else if (up.status == UPLOAD_FILE_WRITE) {
-    if (uploadFile) uploadFile.write(up.buf, up.currentSize);
-  } else if (up.status == UPLOAD_FILE_END) {
-    if (uploadFile) uploadFile.close();
-  }
-}
-
-void handleUploadDone() {
-  server.send(200, "text/html",
-    "<html><body style='font-family:sans-serif;max-width:420px;margin:40px auto'>"
-    "<h2>Saved.</h2><p>Rebooting and connecting to your Q30. "
-    "Make sure the headphones are ON and in pairing mode.</p></body></html>");
-  delay(1500);
-  ESP.restart();
-}
-
-void startUploadMode() {
-  uploadMode = true;
-  WiFi.mode(WIFI_AP);
-  if (strlen(AP_PASS) == 0) WiFi.softAP(AP_SSID);
-  else                      WiFi.softAP(AP_SSID, AP_PASS);
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/upload", HTTP_POST, handleUploadDone, handleUpload);
-  server.begin();
-}
-
-// ---------------- PLAY MODE ----------------
-void startPlayMode() {
-  uploadMode = false;
-  WiFi.mode(WIFI_OFF);                 // radio free for Bluetooth only
-
-  a2dpBuffer.resize(20 * 1024);        // 20 KB PCM buffer (no PSRAM on this board)
-  out.begin(95);                       // start feeding A2DP when buffer is 95% full
-  player.setDelayIfOutputFull(0);
-  player.setVolume(0.7);
-  player.begin();
-  player.setAutoNext(false);           // single file: don't chase a 2nd track
-
-  a2dp.set_data_callback(get_data);
-  a2dp.start(BT_DEVICE_NAME);          // connect to the Q30 by name
-}
-
-// ---------------- SETUP / LOOP ----------------
 void setup() {
   Serial.begin(115200);
   delay(300);
-  pinMode(BOOT_BUTTON, INPUT_PULLUP);
 
-  if (!LittleFS.begin(true)) Serial.println("LittleFS mount failed");
+  // Keep the LoRa radio deselected (we are not using it)
+  pinMode(LORA_CS, OUTPUT);
+  digitalWrite(LORA_CS, HIGH);
 
-  bool forceUpload = (digitalRead(BOOT_BUTTON) == LOW);
-  bool haveSong    = LittleFS.exists(SONG_PATH);
+  // Bring up the SD SPI bus on the LoRa32 TF-card pins
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
 
-  if (!haveSong || forceUpload) {
-    Serial.println(">> UPLOAD MODE (WiFi ESP32_Music, http://192.168.4.1)");
-    startUploadMode();
-  } else {
-    Serial.println(">> PLAY MODE (connecting to Q30...)");
-    startPlayMode();
-  }
+  // 20 KB PCM buffer between the decoder and the A2DP link
+  a2dpBuffer.resize(20 * 1024);
+  out.begin(95);                 // start feeding A2DP once the buffer is 95% full
+
+  player.setDelayIfOutputFull(0);
+  player.setVolume(0.7);
+  player.begin();                // mounts SD, indexes .mp3 files, opens the first track
+  player.setAutoNext(true);      // when a song ends, automatically start the next one
+
+  a2dp.set_data_callback(get_data);
+  a2dp.start(BT_DEVICE_NAME);    // scan for and connect to the Q30 by name
 }
 
 void loop() {
-  if (uploadMode) {
-    server.handleClient();
-  } else {
-    player.copy();
-    if (!player.isActive()) player.setIndex(0);   // song ended -> restart = loop
+  player.copy();                 // decode + push PCM into the buffer
+  if (!player.isActive()) {
+    player.setIndex(0);          // reached the end of the playlist -> loop back to song 0
   }
 }
