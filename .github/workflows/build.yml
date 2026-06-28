@@ -34,12 +34,11 @@ jobs:
       - name: Compile
         run: |
           arduino-cli compile \
-            --fqbn "esp32:esp32:esp32:PartitionScheme=custom,FlashSize=4M,CPUFreq=240,FlashMode=qio" \
-            --build-property "build.partitions=partitions" \
+            --fqbn "esp32:esp32:esp32:PartitionScheme=huge_app,FlashSize=4M,CPUFreq=240,FlashMode=qio" \
             --output-dir ./build \
             ./esp32-q30-player
 
-      - name: Show app size vs partition
+      - name: Show binary sizes
         run: |
           ls -lh ./build/*.bin || true
 
