@@ -23,7 +23,15 @@ jobs:
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@3.0.7
 
-      - name: Install libraries
+      - name: Install audio libraries (pinned)
+        run: |
+          LIB=~/Arduino/libraries
+          mkdir -p "$LIB"
+          git clone --depth 1 --branch v1.2.5 https://github.com/pschatzmann/arduino-audio-tools "$LIB/arduino-audio-tools"
+          git clone --depth 1 https://github.com/pschatzmann/ESP32-A2DP        "$LIB/ESP32-A2DP"
+          git clone --depth 1 https://github.com/pschatzmann/arduino-libhelix  "$LIB/arduino-libhelix"
+
+      - name: Install RFID + OLED libraries
         run: |
           arduino-cli lib install "MFRC522" "Adafruit SSD1306" "Adafruit GFX Library" "Adafruit BusIO"
 
