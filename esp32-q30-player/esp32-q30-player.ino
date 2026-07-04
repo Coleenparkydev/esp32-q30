@@ -34,7 +34,12 @@ const char* BT_DEVICE_NAME = "Soundcore Life Q30";
 #define SD_MOSI 15
 #define LORA_CS 18
 #define MAX_SONGS 100
+// Safety ceiling: the signal can never exceed this % of full scale.
+// 100 = fully transparent (normal music untouched). Lower it (e.g. 90) for a
+// stricter hard cap, at the cost of a little fidelity on the very loudest peaks.
+#define LIMIT_PCT 100
 // ------------------------------
+static const int16_t SAFE_LIMIT = (int16_t)(32767L * LIMIT_PCT / 100);
 
 MFRC522 mfrc(RC522_CS, MFRC522::UNUSED_PIN);          // CS=4, soft reset (RST tied to 3.3V)
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
@@ -53,7 +58,18 @@ int shuffleOrder[MAX_SONGS];
 int songCount = 0;
 int shufflePos = 0;
 
-int32_t get_data(uint8_t* d, int32_t n) { return a2dpBuffer.readArray(d, n); }
+int32_t get_data(uint8_t* d, int32_t n) {
+  int32_t got = a2dpBuffer.readArray(d, n);
+  // Safety clamp: guarantees the samples sent to the headphones never exceed the
+  // ceiling, so no bug/overflow can produce a sudden blast. Transparent at 100%.
+  int16_t* s = (int16_t*)d;
+  int count = got / 2;
+  for (int i = 0; i < count; i++) {
+    if (s[i] >  SAFE_LIMIT) s[i] =  SAFE_LIMIT;
+    else if (s[i] < -SAFE_LIMIT) s[i] = -SAFE_LIMIT;
+  }
+  return got;
+}
 
 void initOLED() {
   Wire.begin(21, 22);
@@ -160,7 +176,7 @@ void setup() {
   a2dpBuffer.resize(24 * 1024);
   out.begin(95);
   player.setDelayIfOutputFull(0);
-  player.setVolume(0.85);
+  player.setVolume(0.70);   // headroom for safety
   player.begin(0, false);                           // mount SD + index, but don't play yet
   player.setAutoNext(false);                        // we drive shuffle manually
 
