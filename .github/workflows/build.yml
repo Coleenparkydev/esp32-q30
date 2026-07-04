@@ -16,24 +16,16 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh -s 0.35.3
           echo "$PWD/bin" >> $GITHUB_PATH
 
-      - name: Install ESP32 core (pinned)
+      - name: Install ESP32 core
         run: |
           arduino-cli config init
           arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@3.0.7
 
-      - name: Install audio libraries (pinned)
+      - name: Install libraries
         run: |
-          LIB=~/Arduino/libraries
-          mkdir -p "$LIB"
-          git clone --depth 1 --branch v1.2.5 https://github.com/pschatzmann/arduino-audio-tools "$LIB/arduino-audio-tools"
-          git clone --depth 1 https://github.com/pschatzmann/ESP32-A2DP        "$LIB/ESP32-A2DP"
-          git clone --depth 1 https://github.com/pschatzmann/arduino-libhelix  "$LIB/arduino-libhelix"
-
-      - name: Install OLED libraries
-        run: |
-          arduino-cli lib install "Adafruit SSD1306" "Adafruit GFX Library" "Adafruit BusIO"
+          arduino-cli lib install "MFRC522" "Adafruit SSD1306" "Adafruit GFX Library" "Adafruit BusIO"
 
       - name: Compile
         run: |
@@ -41,10 +33,6 @@ jobs:
             --fqbn "esp32:esp32:esp32:PartitionScheme=huge_app,FlashSize=4M,CPUFreq=240,FlashMode=qio" \
             --output-dir ./build \
             ./esp32-q30-player
-
-      - name: Show binary sizes
-        run: |
-          ls -lh ./build/*.bin || true
 
       - uses: actions/upload-artifact@v4
         with:
