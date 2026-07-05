@@ -194,15 +194,15 @@ void loop() {
   // song finished -> next shuffled track
   if (songCount > 0 && !player.isActive()) playNextShuffle();
 
-  // ---- joystick (averaged read + wide dead-zone, Y inverted) ----
-  long acc = 0; for (int k = 0; k < 8; k++) acc += analogRead(JOY_Y);
-  int y = acc / 8;                            // 0..4095, center ~2048
-  // wide dead-zone: only the far ends count as a move. Y inverted (up = push up).
-  bool up = (y > 3300), down = (y < 800);
+  // ---- joystick: read only every 50ms so player.copy() is never starved ----
   uint32_t now = millis();
-
-  static uint32_t lastDbg = 0;
-  if (now - lastDbg > 1000) { lastDbg = now; Serial.printf("JOY y=%d up=%d down=%d mode=%d cur=%d\n", y, up, down, uiMode, cursor); }
+  static uint32_t lastJoy = 0;
+  static bool up = false, down = false;
+  if (now - lastJoy >= 50) {
+    lastJoy = now;
+    int y = analogRead(JOY_Y);               // single read; wide dead-zone filters noise
+    up = (y > 3300); down = (y < 800);       // Y inverted (push up = up)
+  }
 
   if ((up || down)) {
     if (uiMode == MODE_PLAY) { uiMode = MODE_LIST; cursor = (nowPlaying >= 0 ? nowPlaying : 0); drawList(); lastActivity = now; lastMove = now; }
