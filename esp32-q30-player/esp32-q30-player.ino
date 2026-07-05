@@ -97,8 +97,17 @@ void buildShuffle() {
 void playSong(int idx) {
   if (idx < 0 || idx >= songCount) return;
   nowPlaying = idx;
+  
+  // 💡 핵심 수정 1: 다음 곡을 열기 전에 확실하게 이전 파일을 닫고 메모리를 해제! (파일 누수 완벽 방지)
+  player.end(); 
+  
   bool ok = player.setPath(songs[idx].c_str());
   Serial.printf("Playing[%d] %s -> %s\n", idx, songs[idx].c_str(), ok ? "OK" : "FAIL");
+  
+  // 💡 핵심 수정 2: 로딩 실패 시 0.5초 대기. (스킵 지옥으로 빠져 기기가 뻗는 것을 방어)
+  if (!ok) {
+    delay(500); 
+  }
 }
 
 void playNextShuffle() {
@@ -160,9 +169,8 @@ void setup() {
   if (!SD.begin(SD_CS, SPI)) Serial.println("SD mount failed");
   scanSongs();
   
-  // 💡 수정 1: 32KB는 메모리 파편화를 유발해 곡 전환 시 메모리 부족(OOM)으로 전체 곡이 스킵됨!
-  // 안전하게 20KB로 설정하여 다음 MP3 파일이 디코딩될 여유 메모리를 충분히 확보해줌.
-  a2dpBuffer.resize(20 * 1024);
+  // 💡 핵심 수정 3: 메모리가 숨 쉴 수 있게 버퍼를 12KB로 안정화
+  a2dpBuffer.resize(12 * 1024);
   out.begin(95);
   player.setDelayIfOutputFull(0);
   player.setVolume(0.70);
@@ -177,13 +185,12 @@ void setup() {
 }
 
 void loop() {
-  // 1. 숨 쉬듯이 항상 오디오 버퍼 채우기
+  // 1. 오디오 버퍼 채우기
   player.copy();
 
   // 2. 노래 끝나면 다음 곡
   if (songCount > 0 && !player.isActive()) {
     playNextShuffle();
-    delay(10); // 에러로 인해 연속 스킵이 발생하더라도 WDT(와치독)가 뻗지 않도록 잠깐 숨고르기
   }
 
   uint32_t now = millis();
@@ -245,14 +252,12 @@ void loop() {
     lastDrawnSong = -1;
   }
 
-  // 💡 수정 2: 화면을 그려야 할 때만 I2C 병목(30ms)을 버티기 위해 버퍼를 꽉꽉 채워넣기
+  // 버퍼가 12KB로 줄었으니 채우는 횟수도 가볍게 조절
   if (needsDrawList || needsDrawPlay) {
-    for (int i = 0; i < 20; i++) {
-      // 버퍼에 더 이상 공간이 없으면(0 반환 시) 무의미한 CPU 낭비 없이 즉시 탈출!
+    for (int i = 0; i < 12; i++) {
       if (player.copy() == 0) break; 
     }
     
-    // 버퍼를 든든하게 채운 상태에서 안심하고 화면 그리기
     if (needsDrawList) drawList();
     if (needsDrawPlay) drawPlay();
   }
