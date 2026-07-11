@@ -1,16 +1,20 @@
 /*
- * LoRa32 T3 (v1.6.1 / v2.1) MP3 player -> Soundcore Life Q30 (A2DP)
+ * LoRa32 T3 MP3 player -> Soundcore Life Q30 (A2DP)
  * + 동기화된 OLED 뮤직비디오 재생 (SSD1306 128x64, 1비트 .bin)
  *
- * 영상 재생 원리:
- *   - PC 인코더가 만든 songXX.bin (프레임당 1024바이트, SSD1306 버퍼 포맷)을
- *     오디오 songXX.mp3 와 짝으로 SD 루트에 둠.
- *   - get_data(A2DP 콜백)가 소비한 바이트 수(g_bytesPlayed)로 재생 위치를 알아냄.
- *   - 지금 보여줄 프레임 = (재생위치 - 헤드폰지연) / 프레임당바이트.
- *   - 그 프레임을 SD에서 읽어 display.getBuffer()에 직접 넣고 display().
- *   - 오디오가 최우선: OLED blit 직전에 버퍼를 채워 언더런 방지. 밀리면 프레임 드롭.
+ * ★ v2 변경점 (fps~1 문제 해결)
+ *   문제: player.copy()(MP3 디코딩)가 loop()을 통째로 잡아먹어서
+ *         loop()이 초당 1~2회만 돌았음 -> 영상이 초당 1프레임밖에 못 그림.
+ *   해결: 오디오 디코딩을 전용 FreeRTOS 태스크(코어0)로 분리.
+ *         loop()(코어1)은 영상 + UI만 전담 -> 12fps 여유.
+ *         BufferRTOS 가 스레드 세이프하므로 두 코어가 안전하게 통신.
+ *         SD 는 두 코어가 공유하므로 뮤텍스로 보호.
  *
- * 조이스틱 위/아래 -> 곡 리스트(영상 멈춤), 5초 무동작 시 다시 영상으로.
+ * 영상 원리:
+ *   - PC 인코더의 songXX.bin (프레임당 1024B, SSD1306 버퍼 포맷)
+ *   - get_data(A2DP 콜백)가 소비한 바이트 = 재생 위치 (마스터 시계)
+ *   - 지금 프레임 = (재생위치 - 헤드폰지연) / 프레임당바이트
+ *   - display.getBuffer()에 직접 읽어넣고 display(). 밀리면 프레임 드롭.
  */
 
 #include <SPI.h>
@@ -38,13 +42,12 @@ const char* BT_DEVICE_NAME = "Soundcore Life Q30";
 // ---------- VIDEO ----------
 #define OLED_ADDR       0x3C
 #define VIDEO_FPS       12                      // .bin 인코딩 fps와 반드시 일치
-#define AUDIO_BPS       (44100UL * 2 * 2)       // 176400 B/s (44.1kHz 스테레오 16bit)
-// 헤드폰/블루투스 지연 보정(ms). 영상이 소리보다 "빠르게" 보이면 값을 올리고,
-// 영상이 소리보다 "늦게" 보이면 값을 내려서 귀로 맞추면 됨.
+#define AUDIO_BPS       (44100UL * 2 * 2)       // 176400 B/s
+// 헤드폰 지연 보정(ms): 영상이 소리보다 빠르면 값 ↑, 늦으면 ↓
 #define SYNC_OFFSET_MS  180
-static const uint32_t BYTES_PER_FRAME  = AUDIO_BPS / VIDEO_FPS;              // 14700
-static const uint32_t SYNC_OFFSET_BYTES = (AUDIO_BPS * SYNC_OFFSET_MS) / 1000; // ~31752
-static const uint16_t FRAME_BYTES = 1024;       // 128x64 / 8
+static const uint32_t BYTES_PER_FRAME   = AUDIO_BPS / VIDEO_FPS;                // 14700
+static const uint32_t SYNC_OFFSET_BYTES = (AUDIO_BPS * SYNC_OFFSET_MS) / 1000;  // ~31752
+static const uint16_t FRAME_BYTES = 1024;
 // ------------------------------
 
 static const int16_t SAFE_LIMIT = (int16_t)(32767L * LIMIT_PCT / 100);
@@ -70,14 +73,20 @@ int nowPlaying = -1;
 uint32_t lastMove = 0, lastActivity = 0;
 
 // ---- video state ----
-volatile uint32_t g_bytesPlayed = 0;   // A2DP가 소비한 PCM 바이트 (재생 위치)
+volatile uint32_t g_bytesPlayed = 0;   // A2DP 소비 바이트 = 재생 위치 (마스터 시계)
 File     videoFile;
 uint32_t videoFrameCount = 0;
 int32_t  lastVideoFrame = -1;
 
+// ---- 코어 간 공유 ----
+SemaphoreHandle_t sdMutex;                 // SD 를 두 코어가 쓰므로 보호 (필수)
+volatile bool     g_songChanged = false;   // loop -> 오디오 태스크 요청
+volatile int      g_requestSong = -1;
+volatile bool     g_audioActive = false;   // 오디오 태스크 -> loop 상태
+
 int32_t get_data(uint8_t* d, int32_t n) {
   int32_t got = a2dpBuffer.readArray(d, n);
-  g_bytesPlayed += (uint32_t)got;      // ★ 재생 위치 추적 (마스터 시계)
+  g_bytesPlayed += (uint32_t)got;      // ★ 마스터 시계
   int16_t* s = (int16_t*)d;
   int count = got / 2;
   for (int i = 0; i < count; i++) {
@@ -95,7 +104,6 @@ String cleanTitle(const String& raw) {
   return s;
 }
 
-// songXX.mp3 -> songXX.bin (같은 이름, 확장자만 교체)
 String videoPathFor(const String& mp3) {
   String v = mp3;
   if (v.endsWith(".mp3") || v.endsWith(".MP3")) v = v.substring(0, v.length() - 4);
@@ -131,87 +139,64 @@ void buildShuffle() {
   shufflePos = 0;
 }
 
+// ---- 영상 파일 열기 (코어1에서만 호출) ----
 void openVideoFor(int idx) {
   if (videoFile) videoFile.close();
   videoFrameCount = 0;
   lastVideoFrame  = -1;
   String vp = videoPathFor(songs[idx]);
+  xSemaphoreTake(sdMutex, portMAX_DELAY);
   videoFile = SD.open(vp.c_str(), FILE_READ);
-  if (videoFile && !videoFile.isDirectory()) {
-    videoFrameCount = videoFile.size() / FRAME_BYTES;
+  bool ok = (videoFile && !videoFile.isDirectory());
+  if (ok) videoFrameCount = videoFile.size() / FRAME_BYTES;
+  xSemaphoreGive(sdMutex);
+  if (ok) {
     Serial.printf("video: %s (%u frames)\n", vp.c_str(), videoFrameCount);
   } else {
     if (videoFile) videoFile.close();
-    Serial.printf("no video: %s (제목만 표시)\n", vp.c_str());
+    Serial.printf("no video: %s (title only)\n", vp.c_str());
   }
 }
 
-void playSong(int idx) {
+// ---- 곡 요청 (loop에서 호출 -> 오디오 태스크가 실제 전환) ----
+void requestSong(int idx) {
   if (idx < 0 || idx >= songCount) return;
   nowPlaying = idx;
-
-  player.end();                                  // 이전 파일 확실히 닫기(누수 방지)
-  bool ok = player.setPath(songs[idx].c_str());
-  Serial.printf("Playing[%d] %s -> %s\n", idx, songs[idx].c_str(), ok ? "OK" : "FAIL");
-  if (!ok) delay(500);                           // 스킵 지옥 방어
-
-  // ★ 영상 싱크 리셋 + 짝 맞는 .bin 열기
   g_bytesPlayed = 0;
-  openVideoFor(idx);
+  g_requestSong = idx;
+  g_songChanged = true;
+  openVideoFor(idx);            // 영상 파일은 코어1이 직접 염
 }
 
-void playNextShuffle() {
-  shufflePos++;
-  if (shufflePos >= songCount) buildShuffle();
-  playSong(shuffleOrder[shufflePos]);
-}
-
-// 오디오 버퍼를 채움(blit/리스트 그리기 직전 언더런 방지). 가득 차면 조기 종료.
-inline void topUpAudio(int iters) {
-  for (int i = 0; i < iters; i++) if (player.copy() == 0) break;
-}
-
-// ---- 영상 한 프레임을 OLED에 (오디오 위치에 맞춰, 밀리면 드롭) ----
-void renderVideo() {
-  if (!oledOK) return;
-
-  // 이 곡에 영상이 없으면 예전처럼 제목 표시 (바뀔 때만)
-  if (!videoFile || videoFrameCount == 0) {
-    static int lastT = -2; static bool lastC = false;
-    bool c = a2dp.is_connected();
-    if (nowPlaying != lastT || c != lastC) {
-      topUpAudio(12);
-      drawPlayTitle();
-      lastT = nowPlaying; lastC = c;
+// ============================================================
+//  오디오 태스크 (코어0 전용) - MP3 디코딩 담당
+// ============================================================
+void audioTask(void* pv) {
+  for (;;) {
+    if (g_songChanged) {                       // 곡 전환 요청 처리
+      g_songChanged = false;
+      int idx = g_requestSong;
+      if (idx >= 0 && idx < songCount) {
+        xSemaphoreTake(sdMutex, portMAX_DELAY);
+        player.end();
+        bool ok = player.setPath(songs[idx].c_str());
+        xSemaphoreGive(sdMutex);
+        Serial.printf("Playing[%d] %s -> %s\n", idx, songs[idx].c_str(), ok ? "OK" : "FAIL");
+        if (!ok) vTaskDelay(pdMS_TO_TICKS(500));
+      }
     }
-    return;
-  }
 
-  uint32_t bp = g_bytesPlayed;
-  uint32_t tf = (bp > SYNC_OFFSET_BYTES) ? (bp - SYNC_OFFSET_BYTES) / BYTES_PER_FRAME : 0;
-  if (tf >= videoFrameCount) tf = videoFrameCount - 1;   // 끝나면 마지막 프레임 유지
-  if ((int32_t)tf == lastVideoFrame) return;             // 같은 프레임 -> 할 일 없음
+    xSemaphoreTake(sdMutex, portMAX_DELAY);    // SD 접근 보호
+    size_t n = player.copy();
+    g_audioActive = player.isActive();
+    xSemaphoreGive(sdMutex);
 
-  topUpAudio(24);                                        // ★ blit 전에 오디오 채우기
-
-  videoFile.seek((uint32_t)tf * FRAME_BYTES);
-  int r = videoFile.read(display.getBuffer(), FRAME_BYTES);
-  if (r == (int)FRAME_BYTES) display.display();          // 프레임 밀어넣기
-  lastVideoFrame = (int32_t)tf;
-
-  // (디버그) 2초마다 실제 fps + 프레임 진행 상황
-  static uint32_t dbgT = 0, blits = 0;
-  blits++;
-  uint32_t nowMs = millis();
-  if (nowMs - dbgT > 2000) {
-    Serial.printf("fps~%.1f  frame=%d/%u  pos=%.1fs\n",
-                  blits / 2.0f, lastVideoFrame, videoFrameCount,
-                  bp / (float)AUDIO_BPS);
-    blits = 0; dbgT = nowMs;
+    if (n == 0) vTaskDelay(pdMS_TO_TICKS(2));  // 버퍼 가득 -> 양보
+    else        taskYIELD();
   }
 }
 
-// 영상 없는 곡용 제목 화면 (기존 drawPlay 역할)
+// ---- 영상 없는 곡용 제목 화면 ----
 void drawPlayTitle() {
   if (!oledOK) return;
   display.clearDisplay();
@@ -226,6 +211,45 @@ void drawPlayTitle() {
   display.setCursor(0, 18);
   if (nowPlaying >= 0) display.print(cleanTitle(songs[nowPlaying]));
   display.display();
+}
+
+// ---- 영상 프레임 렌더 (코어1) ----
+void renderVideo() {
+  if (!oledOK) return;
+
+  if (!videoFile || videoFrameCount == 0) {          // 영상 없는 곡 -> 제목만
+    static int lastT = -2; static bool lastC = false;
+    bool c = a2dp.is_connected();
+    if (nowPlaying != lastT || c != lastC) {
+      drawPlayTitle(); lastT = nowPlaying; lastC = c;
+    }
+    return;
+  }
+
+  uint32_t bp = g_bytesPlayed;
+  uint32_t tf = (bp > SYNC_OFFSET_BYTES) ? (bp - SYNC_OFFSET_BYTES) / BYTES_PER_FRAME : 0;
+  if (tf >= videoFrameCount) tf = videoFrameCount - 1;
+  if ((int32_t)tf == lastVideoFrame) return;         // 아직 같은 프레임
+
+  // SD 읽기 (오디오 태스크와 공유 -> 뮤텍스). 못 잡으면 이번 프레임 스킵.
+  if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+  videoFile.seek((uint32_t)tf * FRAME_BYTES);
+  int r = videoFile.read(display.getBuffer(), FRAME_BYTES);
+  xSemaphoreGive(sdMutex);
+
+  if (r == (int)FRAME_BYTES) display.display();      // I2C blit (SD 잠금 밖)
+  lastVideoFrame = (int32_t)tf;
+
+  // 디버그: 2초마다 실제 fps
+  static uint32_t dbgT = 0, blits = 0;
+  blits++;
+  uint32_t nowMs = millis();
+  if (nowMs - dbgT > 2000) {
+    Serial.printf("fps~%.1f  frame=%d/%u  pos=%.1fs  heap=%u\n",
+                  blits / 2.0f, lastVideoFrame, videoFrameCount,
+                  bp / (float)AUDIO_BPS, ESP.getFreeHeap());
+    blits = 0; dbgT = nowMs;
+  }
 }
 
 void drawList() {
@@ -251,14 +275,12 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== MP3 + OLED video player ===");
+  Serial.println("\n\n=== MP3 + OLED video player (v2: dual-core) ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
   analogReadResolution(12);
 
-  // 주의: Adafruit_SSD1306 는 display() 중 I2C 클럭을 자체값(400k)으로 되돌리므로
-  // 여기서 1MHz 로 올려도 blit 속도엔 영향 없음. 400k 로 12fps 는 충분함.
   Wire.begin(21, 22); Wire.setClock(400000); Wire.setTimeOut(50);
   Wire.beginTransmission(OLED_ADDR);
   if (Wire.endTransmission() == 0) oledOK = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
@@ -267,7 +289,9 @@ void setup() {
   if (!SD.begin(SD_CS, SPI)) Serial.println("SD mount failed");
   scanSongs();
 
-  a2dpBuffer.resize(12 * 1024);        // 메모리 안정화 버퍼
+  sdMutex = xSemaphoreCreateMutex();          // ★ SD 공유 보호
+
+  a2dpBuffer.resize(12 * 1024);
   out.begin(95);
   player.setDelayIfOutputFull(0);
   player.setVolume(0.70);
@@ -277,16 +301,28 @@ void setup() {
   a2dp.set_data_callback(get_data);
   a2dp.start(BT_DEVICE_NAME);
 
-  if (songCount > 0) { buildShuffle(); playSong(shuffleOrder[0]); }
-  else if (oledOK) { display.clearDisplay(); display.setCursor(0,0); display.print("No songs on SD"); display.display(); }
+  // ★ 오디오 디코딩을 코어0 전용 태스크로 (loop=코어1은 영상 전담)
+  xTaskCreatePinnedToCore(audioTask, "audio", 8192, NULL, 2, NULL, 0);
+
+  if (songCount > 0) { buildShuffle(); requestSong(shuffleOrder[0]); }
+  else if (oledOK) {
+    display.clearDisplay(); display.setCursor(0,0);
+    display.print("No songs on SD"); display.display();
+  }
 }
 
 void loop() {
-  // 1. 오디오 버퍼 채우기 (항상, 최우선)
-  player.copy();
+  // 오디오는 코어0 태스크가 담당. 여기(코어1)는 영상 + UI 전담.
 
-  // 2. 노래 끝나면 다음 곡
-  if (songCount > 0 && !player.isActive()) playNextShuffle();
+  // 곡 끝나면 다음 곡 (전환 직후 3초는 무시 -> 스킵 폭주 방지)
+  static uint32_t songStart = 0;
+  if (g_songChanged) songStart = millis();
+  if (songCount > 0 && !g_audioActive && millis() - songStart > 3000) {
+    songStart = millis();
+    shufflePos++;
+    if (shufflePos >= songCount) buildShuffle();
+    requestSong(shuffleOrder[shufflePos]);
+  }
 
   uint32_t now = millis();
   static uint32_t lastJoy = 0;
@@ -300,7 +336,6 @@ void loop() {
 
   bool needsDrawList = false;
 
-  // 조이스틱 위/아래 -> 리스트 모드 (영상 멈춤)
   if ((up || down)) {
     if (uiMode == MODE_PLAY) {
       uiMode = MODE_LIST;
@@ -315,31 +350,27 @@ void loop() {
     }
   }
 
-  // 버튼 -> 곡 선택 후 영상으로 복귀
   static bool prevSw = HIGH;
   bool sw = digitalRead(JOY_SW);
   if (prevSw == HIGH && sw == LOW) {
     if (uiMode == MODE_LIST) {
-      playSong(cursor);            // g_bytesPlayed / lastVideoFrame 리셋됨
+      requestSong(cursor);
       uiMode = MODE_PLAY;
     }
     lastActivity = now;
   }
   prevSw = sw;
 
-  // 5초 무동작 -> 영상으로 복귀
   if (uiMode == MODE_LIST && now - lastActivity > 5000) {
     uiMode = MODE_PLAY;
-    lastVideoFrame = -1;           // 복귀 시 현재 프레임 강제 다시 그림
+    lastVideoFrame = -1;                 // 복귀 시 강제 재그리기
   }
 
-  // ---- 렌더링 ----
   if (uiMode == MODE_LIST) {
-    if (needsDrawList) {
-      topUpAudio(16);              // 리스트 blit 전에도 오디오 채우기
-      drawList();
-    }
+    if (needsDrawList) drawList();
   } else {
-    renderVideo();                 // 영상: 오디오 위치에 맞춰 프레임 표시(드롭 허용)
+    renderVideo();                       // 오디오 위치에 맞춰 프레임 (드롭 허용)
   }
+
+  vTaskDelay(1);                         // 코어1 워치독 먹이기 + 태스크 양보
 }
