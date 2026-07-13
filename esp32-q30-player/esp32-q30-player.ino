@@ -217,21 +217,13 @@ void audioTask(void* pv) {
       }
     }
 
-    // ★ FIX8: 배치 디코딩. 예전엔 copy() 1회 -> 1ms 잠자기라 디코더가 소비속도를
-    //   겨우 앞서서 버퍼가 얕게 유지 -> SD 지연 스파이크마다 언더런('뽁뽁').
-    //   이제 mutex 한 번 잡을 때 버퍼가 찰 때까지(최대 4회) 연속 copy -> 버퍼를
-    //   깊게 유지해 SD 지연을 견딤. 4회로 제한해 영상 SD 대기는 짧게(수 ms).
     xSemaphoreTake(sdMutex, portMAX_DELAY);    // SD 접근 보호
-    int produced = 0;
-    for (int k = 0; k < 4; k++) {
-      if (player.copy() == 0) break;           // 버퍼 참 or 디코딩할 것 없음
-      produced++;
-    }
+    size_t n = player.copy();
     g_audioActive = player.isActive();
     xSemaphoreGive(sdMutex);
 
-    if (produced == 0) vTaskDelay(pdMS_TO_TICKS(2)); // 버퍼 가득/없음 -> 더 쉼
-    else               vTaskDelay(1);                // 1틱 양보 -> 코어0 idle/WDT 먹이기
+    if (n == 0) vTaskDelay(pdMS_TO_TICKS(2));  // 버퍼 가득 -> 양보
+    else        vTaskDelay(1);                 // 1틱 양보 -> 코어0 idle/WDT 굶기 방지
   }
 }
 
@@ -325,7 +317,11 @@ void setup() {
   if (Wire.endTransmission() == 0) oledOK = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
 
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
-  if (!SD.begin(SD_CS, SPI)) Serial.println("SD mount failed");
+  // ★ FIX9(핵심): SD SPI 클럭 명시. 기본값이 4MHz라 읽기가 느려서 디코더가
+  //   버퍼를 못 채우고(=copies 캡), 영상과 SD 경합 -> 언더런('뽁뽁')+fps 하락.
+  //   20MHz로 올리면 읽기 ~5배 -> 버퍼 금방 꽉 참 + 영상도 SD 빨리 확보.
+  //   (혹시 "SD mount failed" 뜨면 카드가 20MHz를 못 버티는 것 -> 16MHz로 낮출 것)
+  if (!SD.begin(SD_CS, SPI, 20000000)) Serial.println("SD mount failed");
   scanSongs();
 
   sdMutex = xSemaphoreCreateMutex();          // ★ SD 공유 보호
