@@ -91,15 +91,19 @@ volatile bool     g_audioActive = false;   // 오디오 태스크 -> loop 상태
 int32_t get_data(uint8_t* d, int32_t n) {
   int32_t got = a2dpBuffer.readArray(d, n);
   portENTER_CRITICAL(&clkMux);
-  g_bytesPlayed += (uint32_t)got;      // ★ 마스터 시계 (RMW -> 스핀락 보호)
-  portEXIT_CRITICAL(&clkMux);
+  g_bytesPlayed += (uint32_t)got;      // ★ 마스터 시계: 실제 오디오 바이트만 카운트
+  portEXIT_CRITICAL(&clkMux);          //    (무음 패딩은 제외해야 영상 싱크 유지)
+  // ★ FIX6(복원): 라이브러리 저자 지침 - 콜백은 '항상' 요청량(n)을 채워 리턴.
+  //   언더런(got < n)에 짧게 리턴하면 SBC 인코더가 거친 잡음('뽁뽁')을 냄.
+  //   모자란 만큼 무음(0)으로 패딩 -> 최악이라도 안 들리는 짧은 무음이 됨.
+  if (got < n) memset(d + got, 0, (size_t)(n - got));
   int16_t* s = (int16_t*)d;
-  int count = got / 2;
+  int count = got / 2;                 // 클램프는 실제 샘플만 (패딩된 무음은 이미 0)
   for (int i = 0; i < count; i++) {
     if (s[i] >  SAFE_LIMIT) s[i] =  SAFE_LIMIT;
     else if (s[i] < -SAFE_LIMIT) s[i] = -SAFE_LIMIT;
   }
-  return got;                          // (검증된 원본 동작으로 복귀)
+  return n;                            // 항상 꽉 찬 프레임 전송 (부분전송 잡음 방지)
 }
 
 String cleanTitle(const String& raw) {
