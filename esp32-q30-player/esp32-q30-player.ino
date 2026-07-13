@@ -74,6 +74,10 @@ uint32_t lastMove = 0, lastActivity = 0;
 
 // ---- video state ----
 volatile uint32_t g_bytesPlayed = 0;   // A2DP 소비 바이트 = 재생 위치 (마스터 시계)
+// ★ FIX3: 마스터 시계 보호. get_data(+=)는 read-modify-write라, 다른 코어가
+//   그 사이에 0을 쓰면 리셋이 씹혀서(clobber) 곡 전환 후 영상이 끝프레임에
+//   붙어버림. 증분과 리셋을 이 스핀락으로 상호배제 -> 리셋이 항상 먹음.
+static portMUX_TYPE clkMux = portMUX_INITIALIZER_UNLOCKED;
 File     videoFile;
 uint32_t videoFrameCount = 0;
 int32_t  lastVideoFrame = -1;
@@ -86,7 +90,9 @@ volatile bool     g_audioActive = false;   // 오디오 태스크 -> loop 상태
 
 int32_t get_data(uint8_t* d, int32_t n) {
   int32_t got = a2dpBuffer.readArray(d, n);
-  g_bytesPlayed += (uint32_t)got;      // ★ 마스터 시계
+  portENTER_CRITICAL(&clkMux);
+  g_bytesPlayed += (uint32_t)got;      // ★ 마스터 시계 (RMW -> 스핀락 보호)
+  portEXIT_CRITICAL(&clkMux);
   int16_t* s = (int16_t*)d;
   int count = got / 2;
   for (int i = 0; i < count; i++) {
@@ -162,7 +168,8 @@ void openVideoFor(int idx) {
 void requestSong(int idx) {
   if (idx < 0 || idx >= songCount) return;
   nowPlaying = idx;
-  g_bytesPlayed = 0;
+  // g_bytesPlayed 리셋은 오디오 태스크가 버퍼 flush와 함께 수행 (FIX1) ->
+  // 이전 곡 PCM(~12KB) 이 새 영상 시계에 섞이지 않게 정렬.
   g_requestSong = idx;
   g_songChanged = true;
   openVideoFor(idx);            // 영상 파일은 코어1이 직접 염
@@ -179,6 +186,10 @@ void audioTask(void* pv) {
       if (idx >= 0 && idx < songCount) {
         xSemaphoreTake(sdMutex, portMAX_DELAY);
         player.end();
+        a2dpBuffer.reset();                    // ★ FIX1: 이전 곡 PCM 비우기
+        portENTER_CRITICAL(&clkMux);
+        g_bytesPlayed = 0;                     //   시계=0 을 새 곡 첫 바이트에 정렬
+        portEXIT_CRITICAL(&clkMux);
         bool ok = player.setPath(songs[idx].c_str());
         xSemaphoreGive(sdMutex);
         Serial.printf("Playing[%d] %s -> %s\n", idx, songs[idx].c_str(), ok ? "OK" : "FAIL");
@@ -192,7 +203,7 @@ void audioTask(void* pv) {
     xSemaphoreGive(sdMutex);
 
     if (n == 0) vTaskDelay(pdMS_TO_TICKS(2));  // 버퍼 가득 -> 양보
-    else        taskYIELD();
+    else        vTaskDelay(1);                 // ★ FIX2: 1틱 양보 -> 코어0 idle/WDT 굶기 방지
   }
 }
 
