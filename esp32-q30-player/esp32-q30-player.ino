@@ -217,13 +217,21 @@ void audioTask(void* pv) {
       }
     }
 
+    // ★ FIX8: 배치 디코딩. 예전엔 copy() 1회 -> 1ms 잠자기라 디코더가 소비속도를
+    //   겨우 앞서서 버퍼가 얕게 유지 -> SD 지연 스파이크마다 언더런('뽁뽁').
+    //   이제 mutex 한 번 잡을 때 버퍼가 찰 때까지(최대 4회) 연속 copy -> 버퍼를
+    //   깊게 유지해 SD 지연을 견딤. 4회로 제한해 영상 SD 대기는 짧게(수 ms).
     xSemaphoreTake(sdMutex, portMAX_DELAY);    // SD 접근 보호
-    size_t n = player.copy();
+    int produced = 0;
+    for (int k = 0; k < 4; k++) {
+      if (player.copy() == 0) break;           // 버퍼 참 or 디코딩할 것 없음
+      produced++;
+    }
     g_audioActive = player.isActive();
     xSemaphoreGive(sdMutex);
 
-    if (n == 0) vTaskDelay(pdMS_TO_TICKS(2));  // 버퍼 가득 -> 양보
-    else        vTaskDelay(1);                 // ★ FIX2: 1틱 양보 -> 코어0 idle/WDT 굶기 방지
+    if (produced == 0) vTaskDelay(pdMS_TO_TICKS(2)); // 버퍼 가득/없음 -> 더 쉼
+    else               vTaskDelay(1);                // 1틱 양보 -> 코어0 idle/WDT 먹이기
   }
 }
 
@@ -322,9 +330,9 @@ void setup() {
 
   sdMutex = xSemaphoreCreateMutex();          // ★ SD 공유 보호
 
-  a2dpBuffer.resize(16 * 1024);        // ★ FIX4: 12KB(68ms)->16KB(~93ms) 쿠션.
-                                       //    SD seek 지연 흡수. heap이 빠듯해(로그상
-                                       //    ~15KB) 20KB에서 16KB로 낮춰 여유 확보.
+  a2dpBuffer.resize(20 * 1024);        // ★ FIX4: 12KB(68ms)->20KB(~116ms) 쿠션.
+                                       //    SD 지연 스파이크 흡수. heap 로그상 최저
+                                       //    ~19KB라 20KB(=-4KB) 감당 가능.
   out.begin(95);
   player.setDelayIfOutputFull(0);
   player.setVolume(0.70);
