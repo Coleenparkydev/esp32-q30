@@ -200,8 +200,8 @@ void audioTask(void* pv) {
         //   * 8회마다 vTaskDelay(1)로 양보 -> sdMutex 독점/워치독 굶김 방지.
         int filled = 0;
         if (ok) {
-          for (int i = 0; i < 48; i++) {
-            if (player.copy() == 0) break;   // 출력버퍼 참 or 더 디코딩할 것 없음
+          for (int i = 0; i < 24; i++) {       // 24회면 쿠션 충분, mutex 점유 ↓
+            if (player.copy() == 0) break;     // 출력버퍼 참 or 더 디코딩할 것 없음
             filled++;
             if ((i & 7) == 7) vTaskDelay(1);
           }
@@ -318,9 +318,9 @@ void setup() {
 
   sdMutex = xSemaphoreCreateMutex();          // ★ SD 공유 보호
 
-  a2dpBuffer.resize(20 * 1024);        // ★ FIX4: 12KB(68ms)->20KB(~116ms) 쿠션.
-                                       //    SD seek 지연(10~20ms) 흡수해 언더런 방지.
-                                       //    (32KB는 heap 부담 -> 20KB로 절충)
+  a2dpBuffer.resize(16 * 1024);        // ★ FIX4: 12KB(68ms)->16KB(~93ms) 쿠션.
+                                       //    SD seek 지연 흡수. heap이 빠듯해(로그상
+                                       //    ~15KB) 20KB에서 16KB로 낮춰 여유 확보.
   out.begin(95);
   player.setDelayIfOutputFull(0);
   player.setVolume(0.70);
@@ -343,14 +343,22 @@ void setup() {
 void loop() {
   // 오디오는 코어0 태스크가 담당. 여기(코어1)는 영상 + UI 전담.
 
-  // 곡 끝나면 다음 곡 (전환 직후 3초는 무시 -> 스킵 폭주 방지)
+  // 곡 끝나면 다음 곡.
+  // ★ FIX7: 시작하자마자 오발(1~2초 만에 다음 곡으로 튐) 방지.
+  //   원래: songStart를 부팅 때 잡는데 BT 페어링에 몇 초 걸려서, 오디오가
+  //   흐르기도 전에 millis()-songStart>3000 이 되고 g_audioActive가 아직
+  //   false라 즉시 다음 곡으로 스킵됨(-> 전환마다 버퍼 리셋 -> 뽁뽁).
+  //   해결: (a) nowPlaying 이 바뀔 때마다 타이머/래치 리셋(레이스 없음),
+  //         (b) 이 곡이 '실제로 재생된 적(sawActive)' 있어야만 종료로 인정.
+  static int      lastNP    = -999;
   static uint32_t songStart = 0;
-  if (g_songChanged) songStart = millis();
-  if (songCount > 0 && !g_audioActive && millis() - songStart > 3000) {
-    songStart = millis();
+  static bool     sawActive = false;
+  if (nowPlaying != lastNP) { lastNP = nowPlaying; songStart = millis(); sawActive = false; }
+  if (g_audioActive) sawActive = true;          // 이 곡이 진짜 재생됐다는 증거
+  if (songCount > 0 && sawActive && !g_audioActive && millis() - songStart > 3000) {
     shufflePos++;
     if (shufflePos >= songCount) buildShuffle();
-    requestSong(shuffleOrder[shufflePos]);
+    requestSong(shuffleOrder[shufflePos]);      // nowPlaying 갱신 -> 다음 루프서 리셋
   }
 
   uint32_t now = millis();
