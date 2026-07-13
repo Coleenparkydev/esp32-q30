@@ -91,15 +91,19 @@ volatile bool     g_audioActive = false;   // 오디오 태스크 -> loop 상태
 int32_t get_data(uint8_t* d, int32_t n) {
   int32_t got = a2dpBuffer.readArray(d, n);
   portENTER_CRITICAL(&clkMux);
-  g_bytesPlayed += (uint32_t)got;      // ★ 마스터 시계 (RMW -> 스핀락 보호)
-  portEXIT_CRITICAL(&clkMux);
+  g_bytesPlayed += (uint32_t)got;      // ★ 마스터 시계 (RMW -> 스핀락 보호). 실제
+  portEXIT_CRITICAL(&clkMux);          //    디코딩된 바이트만 세야 영상 싱크 유지.
+  // ★ FIX6: 언더런(got < n)이면 나머지를 무음(0)으로 채우고 꽉 찬 프레임을 반환.
+  //   부분 전송/미초기화 버퍼가 그대로 나가면 SBC 인코더가 잡음('뽁뽁')을 냄.
+  //   무음으로 패딩하면 최악의 경우도 깔끔한 무음이 됨.
+  if (got < n) memset(d + got, 0, n - got);
   int16_t* s = (int16_t*)d;
-  int count = got / 2;
+  int count = got / 2;                 // 클램프는 실제 샘플만 (패딩된 무음은 이미 0)
   for (int i = 0; i < count; i++) {
     if (s[i] >  SAFE_LIMIT) s[i] =  SAFE_LIMIT;
     else if (s[i] < -SAFE_LIMIT) s[i] = -SAFE_LIMIT;
   }
-  return got;
+  return n;
 }
 
 String cleanTitle(const String& raw) {
@@ -191,8 +195,23 @@ void audioTask(void* pv) {
         g_bytesPlayed = 0;                     //   시계=0 을 새 곡 첫 바이트에 정렬
         portEXIT_CRITICAL(&clkMux);
         bool ok = player.setPath(songs[idx].c_str());
+        // ★ FIX5: 프리필. 첫 곡은 BT 연결 전 버퍼가 저절로 꽉 차서 쿠션이 있지만,
+        //   2번째 곡부터는 reset()으로 0이 된 버퍼를 get_data가 곧바로 빼가서
+        //   바닥에서 맴돌다 SD 지연마다 언더런 -> 주기적 '뽁뽁'. 그래서 정상재생
+        //   진입 전에 여기서 버퍼를 미리 채워 쿠션을 만든다. 디코딩(SD+Helix)이
+        //   재생속도(176KB/s)보다 훨씬 빨라서 수십 ms면 채워짐. sdMutex를 계속
+        //   쥐고 있어 이 동안 영상은 프레임 몇 개 드롭되지만 전환 순간이라 무해.
+        if (ok) {
+          size_t target = a2dpBuffer.size() * 3 / 4;   // 75%까지 쿠션 확보
+          uint32_t t0 = millis();
+          while (a2dpBuffer.available() < target && millis() - t0 < 800) {
+            if (player.copy() == 0) break;             // 더 채울 게 없으면 탈출
+          }
+        }
         xSemaphoreGive(sdMutex);
-        Serial.printf("Playing[%d] %s -> %s\n", idx, songs[idx].c_str(), ok ? "OK" : "FAIL");
+        Serial.printf("Playing[%d] %s -> %s (prefill %u/%u)\n", idx, songs[idx].c_str(),
+                      ok ? "OK" : "FAIL", (unsigned)a2dpBuffer.available(),
+                      (unsigned)a2dpBuffer.size());
         if (!ok) vTaskDelay(pdMS_TO_TICKS(500));
       }
     }
@@ -302,7 +321,8 @@ void setup() {
 
   sdMutex = xSemaphoreCreateMutex();          // ★ SD 공유 보호
 
-  a2dpBuffer.resize(12 * 1024);
+  a2dpBuffer.resize(32 * 1024);        // ★ FIX4: 12KB(68ms)->32KB(~185ms) 쿠션.
+                                       //    SD seek 지연(10~20ms) 흡수해 언더런 방지.
   out.begin(95);
   player.setDelayIfOutputFull(0);
   player.setVolume(0.70);
