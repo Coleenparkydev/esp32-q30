@@ -194,6 +194,13 @@ void openVideoFor(int idx) {
 // ---- 곡 요청 (loop에서 호출 -> 오디오 태스크가 실제 전환) ----
 void requestSong(int idx) {
   if (idx < 0 || idx >= songCount) return;
+  // ★ FIX15: 전환 폭주 방지. 조이스틱 연타/노이즈로 requestSong 이 순식간에 여러 번
+  //   불리면, 매번 곡이 0부터 재시작 + 코어1이 영상 재오픈으로 SD를 때려 A2DP 소스를
+  //   굶겨서 '1초 나오다 끊김'이 됐다. (a)이미 이 곡이면 무시 (b)700ms 디바운스.
+  static uint32_t lastReq = 0;
+  if (idx == nowPlaying) return;
+  if (millis() - lastReq < 700) return;
+  lastReq = millis();
   nowPlaying = idx;
   // g_bytesPlayed 리셋은 오디오 태스크가 버퍼 flush와 함께 수행 (FIX1) ->
   // 이전 곡 PCM(~12KB) 이 새 영상 시계에 섞이지 않게 정렬.
