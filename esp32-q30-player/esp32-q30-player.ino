@@ -166,11 +166,14 @@ void buildShuffle() {
 
 // ---- 영상 파일 열기 (코어1에서만 호출) ----
 void openVideoFor(int idx) {
-  if (videoFile) videoFile.close();
   videoFrameCount = 0;
   lastVideoFrame  = -1;
   String vp = videoPathFor(songs[idx]);
   xSemaphoreTake(sdMutex, portMAX_DELAY);
+  // ★ FIX10: close 도 반드시 뮤텍스 안에서. 예전엔 여기 close()가 뮤텍스 밖이라
+  //   코어0이 SD에서 MP3 읽는 동안 코어1이 SD 파일을 닫아 SPI 버스가 충돌 ->
+  //   SD 트랜잭션 깨짐 -> 오디오 소스 읽기 실패 -> 무음. (조이스틱 전환시 간헐)
+  if (videoFile) videoFile.close();
   videoFile = SD.open(vp.c_str(), FILE_READ);
   bool ok = (videoFile && !videoFile.isDirectory());
   if (ok) videoFrameCount = videoFile.size() / FRAME_BYTES;
@@ -210,6 +213,7 @@ void audioTask(void* pv) {
         g_bytesPlayed = 0;                     //   시계=0 을 새 곡 첫 바이트에 정렬
         portEXIT_CRITICAL(&clkMux);
         bool ok = player.setPath(songs[idx].c_str());
+        xSemaphoreGive(sdMutex);               // ★ FIX10: 프리필 전에 뮤텍스 반납
         // ★ FIX5(안전판): 프리필. 첫 곡은 BT 연결 전 버퍼가 저절로 차서 쿠션이
         //   있지만, 2번째 곡부터는 reset()으로 비운 버퍼를 get_data가 곧바로
         //   빼가서 바닥에서 맴돌다 SD 지연마다 언더런 -> 주기적 '뽁뽁'. 정상재생
@@ -217,15 +221,20 @@ void audioTask(void* pv) {
         //   * available() 의미가 라이브러리 버전마다 달라(읽기가능 vs 빈공간)
         //     그것에 의존하지 않고, 출력버퍼가 찰 때까지(copy()==0) 반복.
         //   * 8회마다 vTaskDelay(1)로 양보 -> sdMutex 독점/워치독 굶김 방지.
+        // ★ FIX10: 프리필도 copy 마다 뮤텍스를 잡았다 놓는다. 예전엔 24회 내내
+        //   뮤텍스를 쥔 채 vTaskDelay 로 '잠들어서' 코어1(조이스틱/영상)이 그 시간
+        //   내내 sdMutex 를 못 잡고 얼어붙었다(=렉). 이제 코어1이 사이에 낄 수 있음.
         int filled = 0;
         if (ok) {
-          for (int i = 0; i < 24; i++) {       // 24회면 쿠션 충분, mutex 점유 ↓
-            if (player.copy() == 0) break;     // 출력버퍼 참 or 더 디코딩할 것 없음
+          for (int i = 0; i < 24; i++) {       // 24회면 쿠션 충분
+            xSemaphoreTake(sdMutex, portMAX_DELAY);
+            size_t c = player.copy();
+            xSemaphoreGive(sdMutex);
+            if (c == 0) break;                 // 출력버퍼 참 or 더 디코딩할 것 없음
             filled++;
-            if ((i & 7) == 7) vTaskDelay(1);
+            if ((i & 7) == 7) vTaskDelay(1);   // 뮤텍스 놓은 상태에서 양보
           }
         }
-        xSemaphoreGive(sdMutex);
         Serial.printf("Playing[%d] %s -> %s (prefill copies=%d)\n",
                       idx, songs[idx].c_str(), ok ? "OK" : "FAIL", filled);
         if (!ok) vTaskDelay(pdMS_TO_TICKS(500));
