@@ -95,17 +95,8 @@ SemaphoreHandle_t sdMutex;                 // SD 를 두 코어가 쓰므로 보
 volatile bool     g_songChanged = false;   // loop -> 오디오 태스크 요청
 volatile int      g_requestSong = -1;
 volatile bool     g_audioActive = false;   // 오디오 태스크 -> loop 상태
-// ★ FIX11: 곡 전환 중 표시. true 동안 get_data 는 a2dpBuffer 를 절대 안 건드리고
-//   무음만 낸다. 예전엔 전환 시 audioTask의 a2dpBuffer.reset()이 BT콜백(get_data)의
-//   readArray()와 '동시에' 버퍼를 만져 내부 락을 서로 물고 데드락 -> 두 코어 정지
-//   -> 재생중 곡 전환하면 통째로 멈춤. 부팅직후 전환은 get_data가 아직 안 돌아 무사.
-volatile bool     g_switching   = false;
 
 int32_t get_data(uint8_t* d, int32_t n) {
-  if (g_switching) {                 // ★ FIX11: 전환 중엔 버퍼 접근 금지(데드락 방지)
-    memset(d, 0, (size_t)n);         //   -> 잠깐 무음. 버퍼는 audioTask가 재구성 중.
-    return n;
-  }
   uint32_t before = (uint32_t)a2dpBuffer.available();  // [계측] 읽기 전 버퍼 잔량
   if (before < g_minBuf) g_minBuf = before;            // [계측] 창구간 최저 수위
   g_getCalls++;
@@ -215,43 +206,22 @@ void audioTask(void* pv) {
       g_songChanged = false;
       int idx = g_requestSong;
       if (idx >= 0 && idx < songCount) {
-        g_switching = true;                    // ★ FIX11: get_data 버퍼 접근 중단
-        vTaskDelay(pdMS_TO_TICKS(5));          //   진행중이던 readArray 끝나길 잠깐 대기
+        // ★ FIX12: 곡 전환을 setPath() '하나로만' 한다. 라이브러리(v1.2.5) 소스 확인:
+        //   - player.end() 는 디코더+출력스트림을 tear down 하며 a2dpBuffer 를 간접적
+        //     으로 건드림 -> BT콜백 get_data 의 readArray 와 경쟁 -> 데드락(두 코어 정지).
+        //   - a2dpBuffer.reset() 도 같은 이유로 get_data 와 경쟁 -> 데드락.
+        //   - setPath() 는 active = setStream(selectStream(path)) 로 스스로 active=true
+        //     되고 새 파일 디코딩 재개. copy() 는 non-blocking(가득이면 0). 그래서
+        //     end()/reset()/프리필/게이트가 전부 불필요 + 유해했음 -> 제거.
+        //   버퍼를 안 비우므로 이전 곡 꼬리 ~116ms 잠깐 재생 후 새 곡. 경쟁 자체가 없어
+        //   데드락/무음/멈춤이 원천 소멸. (쿠션 유지되니 뽁뽁 위험도 오히려 ↓)
         xSemaphoreTake(sdMutex, portMAX_DELAY);
-        player.end();
-        a2dpBuffer.reset();                    // ★ FIX1: 이전 곡 PCM 비우기(이제 단독접근 -> 안전)
-        portENTER_CRITICAL(&clkMux);
-        g_bytesPlayed = 0;                     //   시계=0 을 새 곡 첫 바이트에 정렬
-        portEXIT_CRITICAL(&clkMux);
         bool ok = player.setPath(songs[idx].c_str());
-        xSemaphoreGive(sdMutex);               // ★ FIX10: 프리필 전에 뮤텍스 반납
-        g_switching = false;                   // ★ FIX11수정: 위험구간(reset) 지났으니
-                                               //   여기서 바로 get_data 재개. 프리필은
-                                               //   get_data가 버퍼를 비워줘야 채워지므로
-                                               //   프리필 '전에' 풀어야 함(안 그러면 닭-달걀).
-        // ★ FIX5(안전판): 프리필. 첫 곡은 BT 연결 전 버퍼가 저절로 차서 쿠션이
-        //   있지만, 2번째 곡부터는 reset()으로 비운 버퍼를 get_data가 곧바로
-        //   빼가서 바닥에서 맴돌다 SD 지연마다 언더런 -> 주기적 '뽁뽁'. 정상재생
-        //   진입 전에 여기서 버퍼를 미리 채워 쿠션을 만든다.
-        //   * available() 의미가 라이브러리 버전마다 달라(읽기가능 vs 빈공간)
-        //     그것에 의존하지 않고, 출력버퍼가 찰 때까지(copy()==0) 반복.
-        //   * 8회마다 vTaskDelay(1)로 양보 -> sdMutex 독점/워치독 굶김 방지.
-        // ★ FIX10: 프리필도 copy 마다 뮤텍스를 잡았다 놓는다. 예전엔 24회 내내
-        //   뮤텍스를 쥔 채 vTaskDelay 로 '잠들어서' 코어1(조이스틱/영상)이 그 시간
-        //   내내 sdMutex 를 못 잡고 얼어붙었다(=렉). 이제 코어1이 사이에 낄 수 있음.
-        int filled = 0;
-        if (ok) {
-          for (int i = 0; i < 24; i++) {       // 24회면 쿠션 충분
-            xSemaphoreTake(sdMutex, portMAX_DELAY);
-            size_t c = player.copy();
-            xSemaphoreGive(sdMutex);
-            if (c == 0) break;                 // 출력버퍼 참 or 더 디코딩할 것 없음
-            filled++;
-            if ((i & 7) == 7) vTaskDelay(1);   // 뮤텍스 놓은 상태에서 양보
-          }
-        }
-        Serial.printf("Playing[%d] %s -> %s (prefill copies=%d)\n",
-                      idx, songs[idx].c_str(), ok ? "OK" : "FAIL", filled);
+        portENTER_CRITICAL(&clkMux);
+        g_bytesPlayed = 0;                     // 영상 시계 새 곡 0 (꼬리만큼 잠깐 앞섬-자가보정)
+        portEXIT_CRITICAL(&clkMux);
+        xSemaphoreGive(sdMutex);
+        Serial.printf("Playing[%d] %s -> %s\n", idx, songs[idx].c_str(), ok ? "OK" : "FAIL");
         if (!ok) vTaskDelay(pdMS_TO_TICKS(500));
       }
     }
