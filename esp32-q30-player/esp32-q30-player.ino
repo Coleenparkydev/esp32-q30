@@ -225,6 +225,10 @@ void audioTask(void* pv) {
         portEXIT_CRITICAL(&clkMux);
         bool ok = player.setPath(songs[idx].c_str());
         xSemaphoreGive(sdMutex);               // ★ FIX10: 프리필 전에 뮤텍스 반납
+        g_switching = false;                   // ★ FIX11수정: 위험구간(reset) 지났으니
+                                               //   여기서 바로 get_data 재개. 프리필은
+                                               //   get_data가 버퍼를 비워줘야 채워지므로
+                                               //   프리필 '전에' 풀어야 함(안 그러면 닭-달걀).
         // ★ FIX5(안전판): 프리필. 첫 곡은 BT 연결 전 버퍼가 저절로 차서 쿠션이
         //   있지만, 2번째 곡부터는 reset()으로 비운 버퍼를 get_data가 곧바로
         //   빼가서 바닥에서 맴돌다 SD 지연마다 언더런 -> 주기적 '뽁뽁'. 정상재생
@@ -246,7 +250,6 @@ void audioTask(void* pv) {
             if ((i & 7) == 7) vTaskDelay(1);   // 뮤텍스 놓은 상태에서 양보
           }
         }
-        g_switching = false;                   // ★ FIX11: 쿠션 채웠으니 get_data 재개
         Serial.printf("Playing[%d] %s -> %s (prefill copies=%d)\n",
                       idx, songs[idx].c_str(), ok ? "OK" : "FAIL", filled);
         if (!ok) vTaskDelay(pdMS_TO_TICKS(500));
