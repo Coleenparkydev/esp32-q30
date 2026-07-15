@@ -38,6 +38,9 @@ const char* BT_DEVICE_NAME = "Soundcore Life Q30";
 #define JOY_SW   4
 #define MAX_SONGS 150
 #define LIMIT_PCT 100
+// ★ 진단: 1이면 영상 렌더링(핵심 SD/I2C 부하)을 완전히 끔 -> song2 뽁뢱이
+//   영상 경합 때문인지 순수 오디오/BT 문제인지 가르는 A/B 테스트.
+#define VIDEO_OFF_TEST 1
 
 // ---------- VIDEO ----------
 #define OLED_ADDR       0x3C
@@ -473,7 +476,9 @@ void loop() {
   if (uiMode == MODE_LIST) {
     if (needsDrawList) drawList();
   } else {
+#if !VIDEO_OFF_TEST
     renderVideo();                       // 오디오 위치에 맞춰 프레임 (드롭 허용)
+#endif
   }
 
   vTaskDelay(1);                         // 코어1 워치독 먹이기 + 태스크 양보
