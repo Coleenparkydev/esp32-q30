@@ -371,9 +371,11 @@ void loop() {
       statT = nowS;
       uint32_t ur = g_underruns, urb = g_underrunB, mb = g_minBuf, gc = g_getCalls;
       g_underruns = 0; g_underrunB = 0; g_minBuf = 0xFFFFFFFF; g_getCalls = 0;
-      Serial.printf("[STAT] UR=%u(%uB) minBuf=%u nowBuf=%u calls=%u active=%d pos=%.1fs vid=%s\n",
+      AudioInfo ai = decoder.audioInfo();    // ★ 진단: 디코딩된 실제 포맷(레이트/채널)
+      Serial.printf("[STAT] UR=%u(%uB) minBuf=%u nowBuf=%u calls=%u active=%d sr=%u ch=%u pos=%.1fs vid=%s\n",
                     ur, urb, (mb == 0xFFFFFFFF ? 0 : mb),
                     (uint32_t)a2dpBuffer.available(), gc, (int)g_audioActive,
+                    ai.sample_rate, ai.channels,
                     g_bytesPlayed / (float)AUDIO_BPS,
                     (videoFile && videoFrameCount) ? "Y" : "N");
     }
