@@ -345,6 +345,11 @@ void setup() {
   player.setAutoNext(false);
 
   a2dp.set_data_callback(get_data);
+  // ★ FIX13: A2DP 소스 이벤트 태스크를 코어0으로 고정. 기본값이면 이게 코어1(=loop,
+  //   영상/I2C)에 얹혀서, 곡 전환 때 영상 SD·I2C 작업에 밀려 소스가 굶고 -> Q30가
+  //   미디어 스트림을 서스펜드 -> 전환 후 get_data 정지(뽁뢱)의 원인 후보(#890).
+  //   코어0(오디오 디코드)로 옮겨 영상과 분리. 우선순위도 높게.
+  a2dp.set_task_core(0);
   a2dp.start(BT_DEVICE_NAME);
 
   // ★ 오디오 디코딩을 코어0 전용 태스크로 (loop=코어1은 영상 전담)
@@ -372,10 +377,10 @@ void loop() {
       uint32_t ur = g_underruns, urb = g_underrunB, mb = g_minBuf, gc = g_getCalls;
       g_underruns = 0; g_underrunB = 0; g_minBuf = 0xFFFFFFFF; g_getCalls = 0;
       AudioInfo ai = decoder.audioInfo();    // ★ 진단: 디코딩된 실제 포맷(레이트/채널)
-      Serial.printf("[STAT] UR=%u(%uB) minBuf=%u nowBuf=%u calls=%u conn=%d active=%d sr=%u ch=%u pos=%.1fs vid=%s\n",
+      Serial.printf("[STAT] UR=%u(%uB) minBuf=%u nowBuf=%u calls=%u conn=%d ast=%d active=%d sr=%u ch=%u pos=%.1fs vid=%s\n",
                     ur, urb, (mb == 0xFFFFFFFF ? 0 : mb),
                     (uint32_t)a2dpBuffer.available(), gc,
-                    (int)a2dp.is_connected(), (int)g_audioActive,
+                    (int)a2dp.is_connected(), (int)a2dp.get_audio_state(), (int)g_audioActive,
                     ai.sample_rate, ai.channels,
                     g_bytesPlayed / (float)AUDIO_BPS,
                     (videoFile && videoFrameCount) ? "Y" : "N");
