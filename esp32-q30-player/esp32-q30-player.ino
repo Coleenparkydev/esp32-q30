@@ -82,6 +82,14 @@ File     videoFile;
 uint32_t videoFrameCount = 0;
 int32_t  lastVideoFrame = -1;
 
+// ---- 1단계 계측 (순수 관찰용, 동작 변화 없음) ----
+//   콜백에서 lock 없이 갱신 -> 카운터라 드문 레이스는 무시 가능(콜백은 빨라야 함).
+//   loop()에서 2초마다 스냅샷+리셋해서 출력.
+volatile uint32_t g_underruns = 0;          // got<n (버퍼 바닥) 발생 횟수
+volatile uint32_t g_underrunB = 0;          // 무음(0)으로 채운 총 바이트
+volatile uint32_t g_minBuf    = 0xFFFFFFFF; // 콜백 진입시 버퍼 최저 잔량(B)
+volatile uint32_t g_getCalls  = 0;          // get_data 호출 횟수(참고용)
+
 // ---- 코어 간 공유 ----
 SemaphoreHandle_t sdMutex;                 // SD 를 두 코어가 쓰므로 보호 (필수)
 volatile bool     g_songChanged = false;   // loop -> 오디오 태스크 요청
@@ -89,6 +97,9 @@ volatile int      g_requestSong = -1;
 volatile bool     g_audioActive = false;   // 오디오 태스크 -> loop 상태
 
 int32_t get_data(uint8_t* d, int32_t n) {
+  uint32_t before = (uint32_t)a2dpBuffer.available();  // [계측] 읽기 전 버퍼 잔량
+  if (before < g_minBuf) g_minBuf = before;            // [계측] 창구간 최저 수위
+  g_getCalls++;
   int32_t got = a2dpBuffer.readArray(d, n);
   portENTER_CRITICAL(&clkMux);
   g_bytesPlayed += (uint32_t)got;      // ★ 마스터 시계: 실제 오디오 바이트만 카운트
@@ -96,7 +107,11 @@ int32_t get_data(uint8_t* d, int32_t n) {
   // ★ FIX6(복원): 라이브러리 저자 지침 - 콜백은 '항상' 요청량(n)을 채워 리턴.
   //   언더런(got < n)에 짧게 리턴하면 SBC 인코더가 거친 잡음('뽁뽁')을 냄.
   //   모자란 만큼 무음(0)으로 패딩 -> 최악이라도 안 들리는 짧은 무음이 됨.
-  if (got < n) memset(d + got, 0, (size_t)(n - got));
+  if (got < n) {
+    g_underruns++;                          // [계측] 이번이 뽁뽁 후보
+    g_underrunB += (uint32_t)(n - got);     // [계측] 무음으로 때운 양
+    memset(d + got, 0, (size_t)(n - got));
+  }
   int16_t* s = (int16_t*)d;
   int count = got / 2;                 // 클램프는 실제 샘플만 (패딩된 무음은 이미 0)
   for (int i = 0; i < count; i++) {
@@ -350,6 +365,25 @@ void setup() {
 
 void loop() {
   // 오디오는 코어0 태스크가 담당. 여기(코어1)는 영상 + UI 전담.
+
+  // ★ 1단계 계측: 2초마다 언더런/버퍼 상태 (영상 유무와 무관하게 항상 출력).
+  //   UR>0 & minBuf~0  -> 뽁뽁 = 버퍼 언더런 확정 (2단계로).
+  //   UR==0 인데도 뽁뽁 -> 버퍼 문제 아님 (SBC/BT 쪽, 3단계).
+  //   vid=N            -> 영상 자체가 안 열림 (mp3<->bin 이름 불일치 등).
+  {
+    static uint32_t statT = 0;
+    uint32_t nowS = millis();
+    if (nowS - statT > 2000) {
+      statT = nowS;
+      uint32_t ur = g_underruns, urb = g_underrunB, mb = g_minBuf, gc = g_getCalls;
+      g_underruns = 0; g_underrunB = 0; g_minBuf = 0xFFFFFFFF; g_getCalls = 0;
+      Serial.printf("[STAT] UR=%u(%uB) minBuf=%u nowBuf=%u calls=%u active=%d pos=%.1fs vid=%s\n",
+                    ur, urb, (mb == 0xFFFFFFFF ? 0 : mb),
+                    (uint32_t)a2dpBuffer.available(), gc, (int)g_audioActive,
+                    g_bytesPlayed / (float)AUDIO_BPS,
+                    (videoFile && videoFrameCount) ? "Y" : "N");
+    }
+  }
 
   // 곡 끝나면 다음 곡.
   // ★ FIX7: 시작하자마자 오발(1~2초 만에 다음 곡으로 튐) 방지.
