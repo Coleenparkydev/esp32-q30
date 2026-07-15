@@ -356,6 +356,12 @@ void setup() {
   out.begin(95);
   player.setDelayIfOutputFull(0);
   player.setVolume(0.70);
+  // ★ FIX16 (핵심): 플레이어가 '비활성/부분디코드' 구간에도 출력에 무음을 채우게 한다.
+  //   라이브러리 주석: "A2DP should still receive data to keep the connection open".
+  //   기본값 false라 지금까진 곡 전환/EOF 순간 A2DP가 굶어 스트림이 죽었음
+  //   (-> 자동 다음곡 재생 안 됨, 전환 후 뽁뢱). true로 켜면 전환 갭·SD 지연을
+  //   무음으로 메워 A2DP 스트림이 끊기지 않는다. (메모리의 'silence_on_nodata=true')
+  player.setSilenceOnInactive(true);
   player.begin(0, false);
   player.setAutoNext(false);
 
