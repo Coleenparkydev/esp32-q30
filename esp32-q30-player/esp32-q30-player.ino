@@ -95,8 +95,17 @@ SemaphoreHandle_t sdMutex;                 // SD 를 두 코어가 쓰므로 보
 volatile bool     g_songChanged = false;   // loop -> 오디오 태스크 요청
 volatile int      g_requestSong = -1;
 volatile bool     g_audioActive = false;   // 오디오 태스크 -> loop 상태
+// ★ FIX11: 곡 전환 중 표시. true 동안 get_data 는 a2dpBuffer 를 절대 안 건드리고
+//   무음만 낸다. 예전엔 전환 시 audioTask의 a2dpBuffer.reset()이 BT콜백(get_data)의
+//   readArray()와 '동시에' 버퍼를 만져 내부 락을 서로 물고 데드락 -> 두 코어 정지
+//   -> 재생중 곡 전환하면 통째로 멈춤. 부팅직후 전환은 get_data가 아직 안 돌아 무사.
+volatile bool     g_switching   = false;
 
 int32_t get_data(uint8_t* d, int32_t n) {
+  if (g_switching) {                 // ★ FIX11: 전환 중엔 버퍼 접근 금지(데드락 방지)
+    memset(d, 0, (size_t)n);         //   -> 잠깐 무음. 버퍼는 audioTask가 재구성 중.
+    return n;
+  }
   uint32_t before = (uint32_t)a2dpBuffer.available();  // [계측] 읽기 전 버퍼 잔량
   if (before < g_minBuf) g_minBuf = before;            // [계측] 창구간 최저 수위
   g_getCalls++;
@@ -206,9 +215,11 @@ void audioTask(void* pv) {
       g_songChanged = false;
       int idx = g_requestSong;
       if (idx >= 0 && idx < songCount) {
+        g_switching = true;                    // ★ FIX11: get_data 버퍼 접근 중단
+        vTaskDelay(pdMS_TO_TICKS(5));          //   진행중이던 readArray 끝나길 잠깐 대기
         xSemaphoreTake(sdMutex, portMAX_DELAY);
         player.end();
-        a2dpBuffer.reset();                    // ★ FIX1: 이전 곡 PCM 비우기
+        a2dpBuffer.reset();                    // ★ FIX1: 이전 곡 PCM 비우기(이제 단독접근 -> 안전)
         portENTER_CRITICAL(&clkMux);
         g_bytesPlayed = 0;                     //   시계=0 을 새 곡 첫 바이트에 정렬
         portEXIT_CRITICAL(&clkMux);
@@ -235,6 +246,7 @@ void audioTask(void* pv) {
             if ((i & 7) == 7) vTaskDelay(1);   // 뮤텍스 놓은 상태에서 양보
           }
         }
+        g_switching = false;                   // ★ FIX11: 쿠션 채웠으니 get_data 재개
         Serial.printf("Playing[%d] %s -> %s (prefill copies=%d)\n",
                       idx, songs[idx].c_str(), ok ? "OK" : "FAIL", filled);
         if (!ok) vTaskDelay(pdMS_TO_TICKS(500));
