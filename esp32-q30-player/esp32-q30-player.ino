@@ -95,6 +95,11 @@ SemaphoreHandle_t sdMutex;                 // SD 를 두 코어가 쓰므로 보
 volatile bool     g_songChanged = false;   // loop -> 오디오 태스크 요청
 volatile int      g_requestSong = -1;
 volatile bool     g_audioActive = false;   // 오디오 태스크 -> loop 상태
+// ★ FIX14: 전환 순간 코어1(영상)이 SD를 건드리면, 같은 코어1에 있는 A2DP 소스
+//   태스크가 밀려 Q30가 스트림을 서스펜드(전환후 정지=뽁뢱). 그래서 영상 파일
+//   오픈을 전환 직후가 아니라 조금 뒤로 미뤄 그 순간 코어1을 한가하게 둔다.
+volatile int      g_videoPendingIdx = -1;
+volatile uint32_t g_videoPendingAt  = 0;
 
 int32_t get_data(uint8_t* d, int32_t n) {
   uint32_t before = (uint32_t)a2dpBuffer.available();  // [계측] 읽기 전 버퍼 잔량
@@ -194,7 +199,10 @@ void requestSong(int idx) {
   // 이전 곡 PCM(~12KB) 이 새 영상 시계에 섞이지 않게 정렬.
   g_requestSong = idx;
   g_songChanged = true;
-  openVideoFor(idx);            // 영상 파일은 코어1이 직접 염
+  // ★ FIX14: 영상 오픈을 전환 직후가 아니라 ~300ms 뒤로 미룸(코어1 SD작업 분산).
+  //   그동안은 이전 영상 프레임0이 잠깐 보이지만, A2DP 소스가 안 굶어 스트림 유지.
+  g_videoPendingIdx = idx;
+  g_videoPendingAt  = millis() + 300;
 }
 
 // ============================================================
@@ -345,11 +353,7 @@ void setup() {
   player.setAutoNext(false);
 
   a2dp.set_data_callback(get_data);
-  // ★ FIX13: A2DP 소스 이벤트 태스크를 코어0으로 고정. 기본값이면 이게 코어1(=loop,
-  //   영상/I2C)에 얹혀서, 곡 전환 때 영상 SD·I2C 작업에 밀려 소스가 굶고 -> Q30가
-  //   미디어 스트림을 서스펜드 -> 전환 후 get_data 정지(뽁뢱)의 원인 후보(#890).
-  //   코어0(오디오 디코드)로 옮겨 영상과 분리. 우선순위도 높게.
-  a2dp.set_task_core(0);
+  // (FIX13 되돌림: set_task_core(0)은 우선순위 역전 데드락 유발 -> 소스는 기본 코어 유지)
   a2dp.start(BT_DEVICE_NAME);
 
   // ★ 오디오 디코딩을 코어0 전용 태스크로 (loop=코어1은 영상 전담)
@@ -385,6 +389,12 @@ void loop() {
                     g_bytesPlayed / (float)AUDIO_BPS,
                     (videoFile && videoFrameCount) ? "Y" : "N");
     }
+  }
+
+  // ★ FIX14: 지연된 영상 오픈 처리 (전환 순간을 지나 코어1이 한가할 때 SD 접근).
+  if (g_videoPendingIdx >= 0 && (int32_t)(millis() - g_videoPendingAt) >= 0) {
+    int v = g_videoPendingIdx; g_videoPendingIdx = -1;
+    openVideoFor(v);
   }
 
   // 곡 끝나면 다음 곡.
