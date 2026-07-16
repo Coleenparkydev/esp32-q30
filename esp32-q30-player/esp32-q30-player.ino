@@ -59,6 +59,10 @@ volatile int      g_minAvail   = 0x7FFFFFFF;  // 창 안에서 본 a2dp 버퍼 �
 volatile uint32_t g_underruns  = 0;           // 버퍼가 완전히 바닥친 횟수(=무음 삽입=뽂 의심)
 volatile uint32_t g_maxWriteMs = 0;           // write()가 블록된 최장 시간
 volatile uint32_t g_maxGapMs   = 0;           // copy() 호출 간 최장 공백(코어1이 mutex 물고 있던 시간)
+// v19: 100ms 공백의 범인 분리 — mutex 대기 vs copy() 내부(SD읽기+디코딩)
+volatile uint32_t g_maxMutexMs = 0;           // audioTask가 sdMutex 기다린 최장 시간
+volatile uint32_t g_maxCopyMs  = 0;           // player.copy() 자체가 걸린 최장 시간
+volatile uint32_t g_maxVidMs   = 0;           // 코어1이 sdMutex 쥐고 영상 읽은 최장 시간
 
 // ============================================================
 //  오디오 파이프라인 (라이브러리 정석: source -> player -> A2DPStream)
@@ -237,10 +241,17 @@ void audioTask(void* pv) {
       if (lastCopy && tc - lastCopy > g_maxGapMs) g_maxGapMs = tc - lastCopy;
       lastCopy = tc;
 
+      uint32_t tm0 = millis();
       xSemaphoreTake(sdMutex, portMAX_DELAY);
+      uint32_t tm1 = millis();               // mutex 대기 끝
       n = player.copy();
       act = player.isActive();
+      uint32_t tm2 = millis();               // copy 끝
       xSemaphoreGive(sdMutex);
+      portENTER_CRITICAL(&clkMux);
+      if (tm1 - tm0 > g_maxMutexMs) g_maxMutexMs = tm1 - tm0;
+      if (tm2 - tm1 > g_maxCopyMs)  g_maxCopyMs  = tm2 - tm1;
+      portEXIT_CRITICAL(&clkMux);
     } else {
       vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -297,9 +308,14 @@ void renderVideo() {
   // (v13 의 '오디오 우선 SD 스킵'은 오디오 개선 0 + 영상만 끊김 -> 제거.
   //  = SD 경합이 뽂뽂 원인이 아님을 실증했음.)
   if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+  uint32_t tv0 = millis();
   videoFile.seek((uint32_t)tf * FRAME_BYTES);
   int r = videoFile.read(display.getBuffer(), FRAME_BYTES);
+  uint32_t tvd = millis() - tv0;
   xSemaphoreGive(sdMutex);
+  portENTER_CRITICAL(&clkMux);
+  if (tvd > g_maxVidMs) g_maxVidMs = tvd;      // 코어1이 mutex 쥐고 SD 읽은 시간
+  portEXIT_CRITICAL(&clkMux);
   if (r == (int)FRAME_BYTES) display.display();
   lastVideoFrame = (int32_t)tf;
 }
@@ -327,7 +343,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== MP3 + OLED player (v18: underrun instrumentation) ===");
+  Serial.println("\n\n=== MP3 + OLED player (v19: split the 100ms gap) ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
@@ -378,20 +394,22 @@ void loop() {
     uint32_t nowS = millis();
     if (nowS - statT > 2000) {
       statT = nowS;
-      uint32_t wb, mn, ur, mw, mg;
+      uint32_t wb, mn, ur, mw, mg, mm, mc, mv;
       portENTER_CRITICAL(&clkMux);
       wb = g_wroteBytes;  g_wroteBytes = 0;
       mn = (uint32_t)g_minAvail; g_minAvail = 0x7FFFFFFF;
       ur = g_underruns;   g_underruns = 0;
       mw = g_maxWriteMs;  g_maxWriteMs = 0;
       mg = g_maxGapMs;    g_maxGapMs = 0;
+      mm = g_maxMutexMs;  g_maxMutexMs = 0;
+      mc = g_maxCopyMs;   g_maxCopyMs = 0;
+      mv = g_maxVidMs;    g_maxVidMs = 0;
       portEXIT_CRITICAL(&clkMux);
       // minAvail=0 / under>0 이면 = 버퍼가 바닥 -> 콜백이 무음 삽입 -> 그게 뽂 소리다.
       // minAvail 이 계속 크면 = 언더런 아님 -> 뽂은 링크(RF/SBC) 쪽이다.
-      Serial.printf("[STAT] conn=%d act=%d np=%d wrote=%uB availW=%d pos=%.1fs heap=%u | minAvail=%d under=%u maxWr=%ums maxGap=%ums\n",
-                    (int)a2dp_out.isConnected(), (int)g_audioActive, nowPlaying,
-                    wb, a2dp_out.availableForWrite(), g_bytesPlayed / (float)AUDIO_BPS,
-                    ESP.getFreeHeap(), (int)mn, ur, mw, mg);
+      Serial.printf("[STAT] np=%d wrote=%uB pos=%.1fs heap=%u | minAvail=%d under=%u | maxGap=%ums = mutex=%ums + copy=%ums (wr=%ums) | vid=%ums\n",
+                    nowPlaying, wb, g_bytesPlayed / (float)AUDIO_BPS,
+                    ESP.getFreeHeap(), (int)mn, ur, mg, mm, mc, mw, mv);
     }
   }
 
