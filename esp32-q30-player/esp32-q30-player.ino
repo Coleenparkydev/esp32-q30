@@ -260,11 +260,6 @@ void renderVideo() {
   if (tf >= videoFrameCount) tf = videoFrameCount - 1;
   if ((int32_t)tf == lastVideoFrame) return;         // 아직 같은 프레임
 
-  // ★ 오디오 우선(FIX-SD): 디코드 버퍼가 얕으면 이번 영상 프레임을 스킵하고
-  //   SD 를 디코더에 양보 -> 언더런(0.7s 렉) 제거. 영상 프레임 드롭 << 오디오 끊김.
-  //   곡 전환 직후 빈 버퍼 재충전도 이걸로 빨라져 전환 렉도 완화.
-  if (a2dpBuffer.available() < 8 * 1024) return;
-
   if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
   videoFile.seek((uint32_t)tf * FRAME_BYTES);
   int r = videoFile.read(display.getBuffer(), FRAME_BYTES);
@@ -308,7 +303,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== MP3 + OLED video player (v8: decode->core1, audio-priority SD) ===");
+  Serial.println("\n\n=== MP3 + OLED video player (v9: revert to v7 pull-model, core0) ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
@@ -336,13 +331,9 @@ void setup() {
   a2dp.set_data_callback(get_data);
   a2dp.start(BT_DEVICE_NAME);
 
-  // ★ FIX-CORE: 디코드 태스크를 core 1 로. BT 스택(컨트롤러+Bluedroid+A2DP SBC 인코딩)은
-  //   core 0 에 고정돼 돌기 때문에, 디코드를 core 0 에 두면 BT 와 CPU 를 다퉈 굶는다
-  //   -> 주기적 버퍼 언더런(0.7s 렉). core 1 로 옮겨 BT 에 core 0 을 통째로 내준다.
-  //   (pschatzmann discussion #1930: "무선 스택 쓰면 audio task 는 core 1 을 써라")
-  //   영상(loop)도 core 1 이지만 audioTask 우선순위(2)가 loop(1)보다 높고, 버퍼 얕으면
-  //   renderVideo 가 SD 를 양보하므로 오디오가 항상 우선된다.
-  xTaskCreatePinnedToCore(audioTask, "audio", 8192, NULL, 2, NULL, 1);
+  // 디코드 태스크는 core 0 (원래 file6 설계). 버퍼가 늘 꽉 차는 것으로 보아 디코드는
+  //   병목이 아니므로 core 0 로 충분. (v8에서 core1 로 옮겼더니 전환 시 멈춤/4s 뽂뽂 유발 -> 되돌림)
+  xTaskCreatePinnedToCore(audioTask, "audio", 8192, NULL, 2, NULL, 0);
 
   if (songCount > 0) { buildShuffle(); requestSong(shuffleOrder[0]); }
   else if (oledOK) {
