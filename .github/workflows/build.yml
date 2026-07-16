@@ -19,14 +19,21 @@ jobs:
           arduino-cli config init
           arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32@3.0.7
+          arduino-cli core install esp32:esp32@3.3.10
       - name: Install audio libraries (pinned)
         run: |
           LIB=~/Arduino/libraries
           mkdir -p "$LIB"
           git clone --depth 1 --branch v1.2.5 https://github.com/pschatzmann/arduino-audio-tools "$LIB/arduino-audio-tools"
-          git clone --depth 1 https://github.com/pschatzmann/ESP32-A2DP        "$LIB/ESP32-A2DP"
-          git clone --depth 1 https://github.com/pschatzmann/arduino-libhelix  "$LIB/arduino-libhelix"
+          git clone https://github.com/pschatzmann/ESP32-A2DP       "$LIB/ESP32-A2DP"
+          git -C "$LIB/ESP32-A2DP"  checkout a39ecc16f9f5994a7c48206a6613ed397f80a967
+          git clone https://github.com/pschatzmann/arduino-libhelix "$LIB/arduino-libhelix"
+          git -C "$LIB/arduino-libhelix" checkout 7d0444cac095e2695d63c40ba62b3c40a39ae592
+      - name: Show versions
+        run: |
+          arduino-cli core list
+          echo "--- ESP32-A2DP:"      && git -C ~/Arduino/libraries/ESP32-A2DP       log -1 --oneline
+          echo "--- arduino-libhelix:" && git -C ~/Arduino/libraries/arduino-libhelix log -1 --oneline
       - name: Install OLED libraries
         run: |
           arduino-cli lib install "Adafruit SSD1306" "Adafruit GFX Library" "Adafruit BusIO"
