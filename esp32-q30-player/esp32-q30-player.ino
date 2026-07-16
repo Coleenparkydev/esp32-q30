@@ -343,7 +343,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== MP3 + OLED player (v19: split the 100ms gap) ===");
+  Serial.println("\n\n=== MP3 + OLED player (v20: setDelayIfOutputFull(0) - THE fix) ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
@@ -372,6 +372,15 @@ void setup() {
   //  tx 파워를 min=max=P9 로 박으면 적응형 파워조절이 없어져 근거리에서 수신 포화 가능.)
 
   source.setTimeoutAutoNext(1200);             // EOF 후 1.2s 뒤 active=false -> 다음 곡
+  // ★★ v20 — 뽂뽂의 진짜 원인. AudioPlayer 기본값 delay_if_full=100 (AudioPlayer.h:586).
+  //   copy()는 출력의 availableForWrite()==0 이면 delay(100) 한다.
+  //   A2DP 소스에서 버퍼가 꽉 찬 건 "정상"인데 이걸 "막혔다"로 보고 100ms 잠들어버림.
+  //   그 사이 A2DP 콜백이 87ms 버퍼(15360B/176400Bps)를 다 빨아먹음 -> 언더런 ->
+  //   콜백이 무음 memset 삽입 -> 그게 뽂 소리. 100ms > 87ms 라 수학적으로 반드시 터진다.
+  //   계측 증거(v19): copy=100ms(정확히 상수), under~45/2s, minAvail=0, mutex=6ms/vid=7ms(무죄).
+  //   예전 pull-model 코드엔 이미 setDelayIfOutputFull(0) 이 있었는데 재작성하며 유실됨.
+  //   0 = 대기 안 함. 속도조절은 A2DPStream::write() 가 블로킹으로 해주므로 폭주하지 않는다.
+  player.setDelayIfOutputFull(0);
   player.setSilenceOnInactive(true);
   player.setVolume(1.0);
   player.begin(-1, false);                      // 비활성 시작; 첫 곡은 g_reqIndex 로 요청
