@@ -209,10 +209,18 @@ void audioTask(void* pv) {
     }
 
     // (2) 디코딩 -> A2DP. copy()는 A2DP 버퍼가 가득이면 write에서 블로킹(실시간).
-    xSemaphoreTake(sdMutex, portMAX_DELAY);
-    size_t n = player.copy();
+    //   ★ 연결됐을 때만 copy: 미연결시 write 가 영원히 블로킹(버퍼 안 빠짐)해 sdMutex 를
+    //     쥔 채 멈추는 걸 방지. silence_on_nodata 로 연결중엔 항상 실시간 드레인 -> 블록 짧음.
+    size_t n = 0;
     bool act = player.isActive();
-    xSemaphoreGive(sdMutex);
+    if (a2dp_out.isConnected()) {
+      xSemaphoreTake(sdMutex, portMAX_DELAY);
+      n = player.copy();
+      act = player.isActive();
+      xSemaphoreGive(sdMutex);
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
     g_audioActive = act;
     if (n > 0) sawData = true;
 
@@ -294,7 +302,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== MP3 + OLED player (v10: A2DPStream + setActive fix) ===");
+  Serial.println("\n\n=== MP3 + OLED player (v11: A2DPStream, decode->core1 for BT tx) ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
@@ -326,7 +334,10 @@ void setup() {
   player.begin(-1, false);                      // 비활성 시작; 첫 곡은 g_reqIndex 로 요청
   player.setAutoNext(false);                    // begin()이 소스값으로 덮으므로 뒤에서 off
 
-  xTaskCreatePinnedToCore(audioTask, "audio", 8192, NULL, 2, NULL, 0);
+  // ★ 디코더를 core 1 로: BT 송신 태스크는 core 0 고정 -> core 0 에 디코더 두면 BT 송신이
+  //   CPU 굶어 전송이 반토막(=뽂뽂). core 1 로 옮겨 BT 에 core 0 독점. (A2DPStream 구조라
+  //   pull-model 때의 뮤텍스 레이스 없음 -> 안전. 위 isConnected 가드로 블록 위험도 제거.)
+  xTaskCreatePinnedToCore(audioTask, "audio", 8192, NULL, 2, NULL, 1);
 
   if (songCount > 0) { buildShuffle(); g_reqIndex = shuffleOrder[0]; }
   else if (oledOK) { display.clearDisplay(); display.setCursor(0,0);
