@@ -53,6 +53,13 @@ volatile uint32_t g_bytesPlayed = 0;
 volatile uint32_t g_wroteBytes  = 0;
 static portMUX_TYPE clkMux = portMUX_INITIALIZER_UNLOCKED;
 
+// ---- v18 계측: 뽂 소리는 10~50ms 사건인데 STAT는 2초 평균이라 안 보인다.
+//   오디오 루프(~1ms)에서 버퍼 최저치/언더런/최장 블록시간을 잡아 실제 사건을 본다. (동작 변경 없음)
+volatile int      g_minAvail   = 0x7FFFFFFF;  // 창 안에서 본 a2dp 버퍼 최저 잔량
+volatile uint32_t g_underruns  = 0;           // 버퍼가 완전히 바닥친 횟수(=무음 삽입=뽂 의심)
+volatile uint32_t g_maxWriteMs = 0;           // write()가 블록된 최장 시간
+volatile uint32_t g_maxGapMs   = 0;           // copy() 호출 간 최장 공백(코어1이 mutex 물고 있던 시간)
+
 // ============================================================
 //  오디오 파이프라인 (라이브러리 정석: source -> player -> A2DPStream)
 // ============================================================
@@ -64,10 +71,13 @@ A2DPStream a2dp_out;
 class CountingOutput : public AudioOutput {
  public:
   size_t write(const uint8_t* data, size_t len) override {
-    size_t w = a2dp_out.write(data, len);      // 버퍼 가득차면 블로킹 = 실시간 속도조절
+    uint32_t t0 = millis();
+    size_t w = a2dp_out.write(data, len);      // tx_write_timeout_ms=-1 -> 완전 블로킹(무손실)
+    uint32_t dt = millis() - t0;
     portENTER_CRITICAL(&clkMux);
     g_bytesPlayed += (uint32_t)w;
     g_wroteBytes  += (uint32_t)w;
+    if (dt > g_maxWriteMs) g_maxWriteMs = dt;
     portEXIT_CRITICAL(&clkMux);
     return w;
   }
@@ -214,6 +224,19 @@ void audioTask(void* pv) {
     size_t n = 0;
     bool act = player.isActive();
     if (a2dp_out.isConnected()) {
+      // 계측: copy() 직전 버퍼 잔량 = A2DP 콜백이 실제로 얼마나 남겨뒀는지.
+      //   0 이면 콜백이 무음을 꽂았다는 뜻 = 뽂 소리의 직접 증거.
+      int av = a2dp_out.available();
+      portENTER_CRITICAL(&clkMux);
+      if (av < g_minAvail) g_minAvail = av;
+      if (av == 0 && g_audioActive) g_underruns++;
+      portEXIT_CRITICAL(&clkMux);
+
+      static uint32_t lastCopy = 0;
+      uint32_t tc = millis();
+      if (lastCopy && tc - lastCopy > g_maxGapMs) g_maxGapMs = tc - lastCopy;
+      lastCopy = tc;
+
       xSemaphoreTake(sdMutex, portMAX_DELAY);
       n = player.copy();
       act = player.isActive();
@@ -304,7 +327,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== MP3 + OLED player (v14 = v10 restored: A2DPStream + setActive) ===");
+  Serial.println("\n\n=== MP3 + OLED player (v18: underrun instrumentation) ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
@@ -355,11 +378,20 @@ void loop() {
     uint32_t nowS = millis();
     if (nowS - statT > 2000) {
       statT = nowS;
-      uint32_t wb; portENTER_CRITICAL(&clkMux); wb = g_wroteBytes; g_wroteBytes = 0; portEXIT_CRITICAL(&clkMux);
-      Serial.printf("[STAT] conn=%d act=%d np=%d wrote=%uB availW=%d pos=%.1fs heap=%u min=%u\n",
+      uint32_t wb, mn, ur, mw, mg;
+      portENTER_CRITICAL(&clkMux);
+      wb = g_wroteBytes;  g_wroteBytes = 0;
+      mn = (uint32_t)g_minAvail; g_minAvail = 0x7FFFFFFF;
+      ur = g_underruns;   g_underruns = 0;
+      mw = g_maxWriteMs;  g_maxWriteMs = 0;
+      mg = g_maxGapMs;    g_maxGapMs = 0;
+      portEXIT_CRITICAL(&clkMux);
+      // minAvail=0 / under>0 이면 = 버퍼가 바닥 -> 콜백이 무음 삽입 -> 그게 뽂 소리다.
+      // minAvail 이 계속 크면 = 언더런 아님 -> 뽂은 링크(RF/SBC) 쪽이다.
+      Serial.printf("[STAT] conn=%d act=%d np=%d wrote=%uB availW=%d pos=%.1fs heap=%u | minAvail=%d under=%u maxWr=%ums maxGap=%ums\n",
                     (int)a2dp_out.isConnected(), (int)g_audioActive, nowPlaying,
                     wb, a2dp_out.availableForWrite(), g_bytesPlayed / (float)AUDIO_BPS,
-                    ESP.getFreeHeap(), ESP.getMinFreeHeap());
+                    ESP.getFreeHeap(), (int)mn, ur, mw, mg);
     }
   }
 
