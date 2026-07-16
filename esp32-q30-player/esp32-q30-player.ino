@@ -260,6 +260,11 @@ void renderVideo() {
   if (tf >= videoFrameCount) tf = videoFrameCount - 1;
   if ((int32_t)tf == lastVideoFrame) return;         // 아직 같은 프레임
 
+  // ★ 오디오 우선(FIX-SD): 디코드 버퍼가 얕으면 이번 영상 프레임을 스킵하고
+  //   SD 를 디코더에 양보 -> 언더런(0.7s 렉) 제거. 영상 프레임 드롭 << 오디오 끊김.
+  //   곡 전환 직후 빈 버퍼 재충전도 이걸로 빨라져 전환 렉도 완화.
+  if (a2dpBuffer.available() < 8 * 1024) return;
+
   if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
   videoFile.seek((uint32_t)tf * FRAME_BYTES);
   int r = videoFile.read(display.getBuffer(), FRAME_BYTES);
@@ -272,9 +277,10 @@ void renderVideo() {
   blits++;
   uint32_t nowMs = millis();
   if (nowMs - dbgT > 2000) {
-    Serial.printf("fps~%.1f  frame=%d/%u  pos=%.1fs  conn=%d  heap=%u\n",
+    Serial.printf("fps~%.1f  frame=%d/%u  pos=%.1fs  conn=%d  buf=%uB  heap=%u\n",
                   blits / 2.0f, lastVideoFrame, videoFrameCount,
-                  bp / (float)AUDIO_BPS, (int)a2dp.is_connected(), ESP.getFreeHeap());
+                  bp / (float)AUDIO_BPS, (int)a2dp.is_connected(),
+                  (unsigned)a2dpBuffer.available(), ESP.getFreeHeap());
     blits = 0; dbgT = nowMs;
   }
 }
@@ -302,7 +308,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== MP3 + OLED video player (v5: pull-model 복귀) ===");
+  Serial.println("\n\n=== MP3 + OLED video player (v8: decode->core1, audio-priority SD) ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
@@ -330,7 +336,13 @@ void setup() {
   a2dp.set_data_callback(get_data);
   a2dp.start(BT_DEVICE_NAME);
 
-  xTaskCreatePinnedToCore(audioTask, "audio", 8192, NULL, 2, NULL, 0);
+  // ★ FIX-CORE: 디코드 태스크를 core 1 로. BT 스택(컨트롤러+Bluedroid+A2DP SBC 인코딩)은
+  //   core 0 에 고정돼 돌기 때문에, 디코드를 core 0 에 두면 BT 와 CPU 를 다퉈 굶는다
+  //   -> 주기적 버퍼 언더런(0.7s 렉). core 1 로 옮겨 BT 에 core 0 을 통째로 내준다.
+  //   (pschatzmann discussion #1930: "무선 스택 쓰면 audio task 는 core 1 을 써라")
+  //   영상(loop)도 core 1 이지만 audioTask 우선순위(2)가 loop(1)보다 높고, 버퍼 얕으면
+  //   renderVideo 가 SD 를 양보하므로 오디오가 항상 우선된다.
+  xTaskCreatePinnedToCore(audioTask, "audio", 8192, NULL, 2, NULL, 1);
 
   if (songCount > 0) { buildShuffle(); requestSong(shuffleOrder[0]); }
   else if (oledOK) {
