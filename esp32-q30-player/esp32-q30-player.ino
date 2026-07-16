@@ -238,6 +238,7 @@ void audioTask(void* pv) {
 
     vTaskDelay(1);
   }
+#endif  // AUDIO_SELFTEST
 }
 
 void drawPlayTitle() {
