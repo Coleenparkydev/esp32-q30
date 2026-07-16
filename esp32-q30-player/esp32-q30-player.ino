@@ -24,7 +24,7 @@
 // ---------- SETTINGS ----------
 // ★ 진단 토글: 1 = SD/디코더 우회하고 440Hz 사인톤을 A2DP로 직접. 삐- 들리면 링크정상.
 //   0 = 실제 재생(정상). setActive 버그 고쳤으니 0 으로 빌드/테스트.
-#define AUDIO_SELFTEST 0
+#define AUDIO_SELFTEST 1
 const char* BT_DEVICE_NAME = "Soundcore Life Q30";
 #define SD_CS   13
 #define SD_SCK  14
@@ -55,8 +55,11 @@ static portMUX_TYPE clkMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ---- v18 계측: 뽂 소리는 10~50ms 사건인데 STAT는 2초 평균이라 안 보인다.
 //   오디오 루프(~1ms)에서 버퍼 최저치/언더런/최장 블록시간을 잡아 실제 사건을 본다. (동작 변경 없음)
-volatile int      g_minAvail   = 0x7FFFFFFF;  // 창 안에서 본 a2dp 버퍼 최저 잔량
-volatile uint32_t g_underruns  = 0;           // 버퍼가 완전히 바닥친 횟수(=무음 삽입=뽂 의심)
+// ★ v21 정정: a2dp_out.available() 은 TX 모드에서 항상 0 을 리턴한다(A2DPStream.h:288).
+//   v18~v20 의 minAvail/under 는 무의미한 값이었다. TX 에서 유효한 건 availableForWrite() 뿐.
+//   availableForWrite() == buffer_size(15360) 이면 버퍼가 텅 빈 것 = 진짜 언더런 = 무음 삽입 = 뽂.
+volatile int      g_maxAvailW  = 0;           // 창 안에서 본 최대 여유공간(클수록 버퍼가 비었다)
+volatile uint32_t g_underruns  = 0;           // availW 가 버퍼크기의 90% 이상이던 횟수(=거의 텅 빔)
 volatile uint32_t g_maxWriteMs = 0;           // write()가 블록된 최장 시간
 volatile uint32_t g_maxGapMs   = 0;           // copy() 호출 간 최장 공백(코어1이 mutex 물고 있던 시간)
 // v19: 100ms 공백의 범인 분리 — mutex 대기 vs copy() 내부(SD읽기+디코딩)
@@ -228,12 +231,11 @@ void audioTask(void* pv) {
     size_t n = 0;
     bool act = player.isActive();
     if (a2dp_out.isConnected()) {
-      // 계측: copy() 직전 버퍼 잔량 = A2DP 콜백이 실제로 얼마나 남겨뒀는지.
-      //   0 이면 콜백이 무음을 꽂았다는 뜻 = 뽂 소리의 직접 증거.
-      int av = a2dp_out.available();
+      // 계측: 여유공간이 클수록 버퍼가 비어있다. 15360(=전체)에 가까우면 텅 빔 = 언더런.
+      int afw = a2dp_out.availableForWrite();
       portENTER_CRITICAL(&clkMux);
-      if (av < g_minAvail) g_minAvail = av;
-      if (av == 0 && g_audioActive) g_underruns++;
+      if (afw > g_maxAvailW) g_maxAvailW = afw;
+      if (afw >= 13824 && g_audioActive) g_underruns++;   // 15360의 90% 이상 비었음
       portEXIT_CRITICAL(&clkMux);
 
       static uint32_t lastCopy = 0;
@@ -343,7 +345,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== MP3 + OLED player (v20: setDelayIfOutputFull(0) - THE fix) ===");
+  Serial.println("\n\n=== SELFTEST: 440Hz sine direct to A2DP (no SD, no decoder, no player) ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
@@ -406,7 +408,7 @@ void loop() {
       uint32_t wb, mn, ur, mw, mg, mm, mc, mv;
       portENTER_CRITICAL(&clkMux);
       wb = g_wroteBytes;  g_wroteBytes = 0;
-      mn = (uint32_t)g_minAvail; g_minAvail = 0x7FFFFFFF;
+      mn = (uint32_t)g_maxAvailW; g_maxAvailW = 0;
       ur = g_underruns;   g_underruns = 0;
       mw = g_maxWriteMs;  g_maxWriteMs = 0;
       mg = g_maxGapMs;    g_maxGapMs = 0;
@@ -416,7 +418,7 @@ void loop() {
       portEXIT_CRITICAL(&clkMux);
       // minAvail=0 / under>0 이면 = 버퍼가 바닥 -> 콜백이 무음 삽입 -> 그게 뽂 소리다.
       // minAvail 이 계속 크면 = 언더런 아님 -> 뽂은 링크(RF/SBC) 쪽이다.
-      Serial.printf("[STAT] np=%d wrote=%uB pos=%.1fs heap=%u | minAvail=%d under=%u | maxGap=%ums = mutex=%ums + copy=%ums (wr=%ums) | vid=%ums\n",
+      Serial.printf("[STAT] np=%d wrote=%uB pos=%.1fs heap=%u | maxAvailW=%d/15360 empty=%u | maxGap=%ums = mutex=%ums + copy=%ums (wr=%ums) | vid=%ums\n",
                     nowPlaying, wb, g_bytesPlayed / (float)AUDIO_BPS,
                     ESP.getFreeHeap(), (int)mn, ur, mg, mm, mc, mw, mv);
     }
