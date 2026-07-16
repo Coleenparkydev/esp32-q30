@@ -194,19 +194,22 @@ void audioTask(void* pv) {
         // ★ 전환 프로토콜: get_data 를 먼저 무음으로 세운 뒤(레이스 차단) 깨끗이 정리.
         //   이렇게 하면 end()/reset() 를 안전하게 부를 수 있어 데드락 없이도
         //   이전 곡 디코더/스트림/버퍼가 완전히 리셋됨 -> "틀수록 이상해짐" 누적 오염 해결.
-        g_switching = true;
+        // 가드는 '버퍼에 안 쓰는' 정리 구간(end/reset/setPath)에만 건다.
+        g_switching = true;                    // get_data 무음화 -> 아래 reset 과의 레이스 차단
         vTaskDelay(pdMS_TO_TICKS(8));          // 진행 중이던 get_data 콜이 빠져나갈 시간
         xSemaphoreTake(sdMutex, portMAX_DELAY);
         player.end();                          // 이전 곡 스트림/디코더 정리 (누수/오염 방지)
-        a2dpBuffer.reset();                    // 이전 곡 PCM flush
+        a2dpBuffer.reset();                    // 이전 곡 PCM flush (get_data 가드 상태라 안전)
         portENTER_CRITICAL(&clkMux);
         g_bytesPlayed = 0;                     // 시계=0 을 새 곡에 정렬 (영상 리셋)
         portEXIT_CRITICAL(&clkMux);
         bool ok = player.setPath(songs[idx].c_str());
-        // ★ FIX5: 전환 직후 버퍼 프리필 -> 2번째 곡도 쿠션 갖고 시작(언더런 렉 방지)
-        for (int i = 0; i < 24 && player.isActive(); i++) player.copy();
         xSemaphoreGive(sdMutex);
-        g_switching = false;                   // get_data 재개
+        g_switching = false;                   // ★ copy 하기 '전에' 드레인부터 재개!
+        // 프리필 안 함: 가드 켜진 채로 copy() 하면 get_data 가 버퍼를 안 비워
+        //   a2dpBuffer 쓰기가 영원히 블로킹 -> audioTask 데드락(=v6 전부 멈춘 원인).
+        //   이제 버퍼는 메인루프 copy 가 채우고 get_data 가 동시에 비우므로 안 막힘.
+        //   시작 갭은 FIX6(언더런 무음채움)이 조용히 덮는다.
         Serial.printf("Playing[%d] %s -> %s\n", idx, songs[idx].c_str(), ok ? "OK" : "FAIL");
         if (!ok) vTaskDelay(pdMS_TO_TICKS(500));
       }
