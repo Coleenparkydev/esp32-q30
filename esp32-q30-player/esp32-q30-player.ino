@@ -24,6 +24,11 @@
 #include "AudioTools/AudioCodecs/CodecMP3Helix.h"
 
 // ---------- SETTINGS ----------
+// ★ 진단 토글: 1 = SD/디코더 우회하고 440Hz 사인톤을 A2DP로 직접 송출.
+//   삐- 들리면 BT링크 정상(문제는 디코드경로), 무음이면 Q30링크 문제.
+//   0 = 실제 재생(정상 모드). setActive 버그 수정 후엔 0으로 두고 이걸로 플래시.
+//   만약 0에서도 무음이면 → 1로 바꿔 재플래시해서 '삐-' 들리는지로 링크/디코드 판별.
+#define AUDIO_SELFTEST 0
 const char* BT_DEVICE_NAME = "Soundcore Life Q30";
 #define SD_CS   13
 #define SD_SCK  14
@@ -175,6 +180,24 @@ void announceSong(int idx) {
 //  전환은 player.setIndex() 뿐. A2DPStream 은 그대로 두면 무음이 계속 흘러 안 끊긴다.
 // ============================================================
 void audioTask(void* pv) {
+#if AUDIO_SELFTEST
+  // 440Hz 사인톤을 A2DP로 직접 (디코더/SD/플레이어 전부 우회) — 링크 검증용
+  static int16_t buf[256 * 2];
+  float phase = 0.0f;
+  const float inc = 2.0f * PI * 440.0f / 44100.0f;
+  Serial.println(">>> AUDIO_SELFTEST: 440Hz tone direct to A2DP");
+  for (;;) {
+    for (int i = 0; i < 256; i++) {
+      int16_t s = (int16_t)(9000.0f * sinf(phase));
+      phase += inc; if (phase > 2.0f * PI) phase -= 2.0f * PI;
+      buf[i * 2] = s; buf[i * 2 + 1] = s;
+    }
+    size_t w = a2dp_out.write((uint8_t*)buf, sizeof(buf));
+    portENTER_CRITICAL(&clkMux); g_wroteBytes += (uint32_t)w; portEXIT_CRITICAL(&clkMux);
+    g_audioActive = a2dp_out.isConnected();
+    vTaskDelay(1);
+  }
+#else
   static uint32_t songStart = 0;
   static bool     sawData   = false;
   for (;;) {
@@ -183,7 +206,8 @@ void audioTask(void* pv) {
     if (req >= 0 && req < songCount) {
       g_reqIndex = -1;
       xSemaphoreTake(sdMutex, portMAX_DELAY);
-      player.setIndex(req);                     // A2DPStream 은 건드리지 않음 = 무음 유지
+      player.setIndex(req);                     // 인덱스만 선택 (활성화 안 됨!)
+      player.setActive(true);                   // ★ FIX: setIndex는 재생을 시작 안 함. 이게 없어서 무음이었다.
       xSemaphoreGive(sdMutex);
       songStart = millis(); sawData = false;
       announceSong(req);
@@ -206,6 +230,7 @@ void audioTask(void* pv) {
       int idx = shuffleOrder[shufflePos];
       xSemaphoreTake(sdMutex, portMAX_DELAY);
       player.setIndex(idx);
+      player.setActive(true);                   // ★ FIX: 다음 곡도 명시적으로 활성화
       xSemaphoreGive(sdMutex);
       songStart = millis(); sawData = false;
       announceSong(idx);
