@@ -343,9 +343,10 @@ void loop() {
     if (nowS - statT > 2000) {
       statT = nowS;
       uint32_t wb; portENTER_CRITICAL(&clkMux); wb = g_wroteBytes; g_wroteBytes = 0; portEXIT_CRITICAL(&clkMux);
-      Serial.printf("[STAT] conn=%d act=%d np=%d wrote=%uB availW=%d pos=%.1fs\n",
+      Serial.printf("[STAT] conn=%d act=%d np=%d wrote=%uB availW=%d pos=%.1fs heap=%u min=%u\n",
                     (int)a2dp_out.isConnected(), (int)g_audioActive, nowPlaying,
-                    wb, a2dp_out.availableForWrite(), g_bytesPlayed / (float)AUDIO_BPS);
+                    wb, a2dp_out.availableForWrite(), g_bytesPlayed / (float)AUDIO_BPS,
+                    ESP.getFreeHeap(), ESP.getMinFreeHeap());
     }
   }
 
