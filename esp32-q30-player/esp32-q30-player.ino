@@ -16,6 +16,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include "esp_bt.h"                            // BT 처리량 안정화(sleep/tx power)용
 #include "AudioTools.h"
 #include "AudioTools/Communication/A2DPStream.h"
 #include "AudioTools/Disk/AudioSourceSD.h"
@@ -64,12 +65,23 @@ A2DPStream a2dp_out;
 class CountingOutput : public AudioOutput {
  public:
   size_t write(const uint8_t* data, size_t len) override {
-    size_t w = a2dp_out.write(data, len);      // 버퍼 가득차면 블로킹 = 실시간 속도조절
+    // ★ 데이터 무손실: write 가 짧게 리턴해도 나머지를 버리지 않고 끝까지 씀.
+    //   (만약 뽂뽂 원인이 '짧은 write -> AudioPlayer가 나머지 드롭'이면 이게 진짜 fix)
+    //   연결 끊기면 탈출해 무한루프 방지. 연결중엔 실시간 드레인이라 블록 짧음.
+    size_t done = 0;
+    while (done < len) {
+      size_t w = a2dp_out.write(data + done, len - done);
+      done += w;
+      if (w == 0) {
+        if (!a2dp_out.isConnected()) break;
+        vTaskDelay(1);
+      }
+    }
     portENTER_CRITICAL(&clkMux);
-    g_bytesPlayed += (uint32_t)w;
-    g_wroteBytes  += (uint32_t)w;
+    g_bytesPlayed += (uint32_t)done;
+    g_wroteBytes  += (uint32_t)done;
     portEXIT_CRITICAL(&clkMux);
-    return w;
+    return done;
   }
   int availableForWrite() override { return a2dp_out.availableForWrite(); }
   void setAudioInfo(AudioInfo info) override {
@@ -271,6 +283,11 @@ void renderVideo() {
   uint32_t tf = (bp > SYNC_OFFSET_BYTES) ? (bp - SYNC_OFFSET_BYTES) / BYTES_PER_FRAME : 0;
   if (tf >= videoFrameCount) tf = videoFrameCount - 1;
   if ((int32_t)tf == lastVideoFrame) return;
+  // ★★ v13 (esp32.com t=31768 확인: SD읽기가 A2DP공급을 굶기면 즉시 크래클):
+  //   디코드 버퍼가 비어가면(availableForWrite 큼 = 버퍼에 빈 공간 많음) 이번 영상 프레임을
+  //   건너뛰고 SD 를 디코더에 양보. -> A2DP 공급이 SD 경합에 굶지 않음 = 뽂뽂 근본 차단.
+  //   버퍼가 차 있을 때(availW 작음)만 영상 읽음. 영상 프레임 드롭 << 오디오 팝.
+  if (a2dp_out.availableForWrite() > 3072) return;
   if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
   videoFile.seek((uint32_t)tf * FRAME_BYTES);
   int r = videoFile.read(display.getBuffer(), FRAME_BYTES);
@@ -302,7 +319,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== MP3 + OLED player (v11: A2DPStream, decode->core1 for BT tx) ===");
+  Serial.println("\n\n=== MP3 + OLED player (v13: audio-priority SD + BT tx-power/no-sleep) ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
@@ -328,16 +345,20 @@ void setup() {
   a2dp_out.setVolume(0.65);
   a2dp_out.begin(cfg);
 
+  // ★★ v12: 측정된 '전송 반토막'(버퍼 만땅인데 wrote 절반) = BT 링크 처리량 저하 직접 대응.
+  //   (1) modem sleep 끄기: 컨트롤러 절전으로 처리량/타이밍 떨어지는 것 방지
+  //   (2) BR/EDR TX 파워 최대(+9dBm): 링크 마진↑ -> 재전송↓ -> 처리량 안정 (뽂뽂 완화)
+  esp_bt_sleep_disable();
+  esp_bredr_tx_power_set(ESP_PWR_LVL_P9, ESP_PWR_LVL_P9);
+
   source.setTimeoutAutoNext(1200);             // EOF 후 1.2s 뒤 active=false -> 다음 곡
   player.setSilenceOnInactive(true);
   player.setVolume(1.0);
   player.begin(-1, false);                      // 비활성 시작; 첫 곡은 g_reqIndex 로 요청
   player.setAutoNext(false);                    // begin()이 소스값으로 덮으므로 뒤에서 off
 
-  // ★ 디코더를 core 1 로: BT 송신 태스크는 core 0 고정 -> core 0 에 디코더 두면 BT 송신이
-  //   CPU 굶어 전송이 반토막(=뽂뽂). core 1 로 옮겨 BT 에 core 0 독점. (A2DPStream 구조라
-  //   pull-model 때의 뮤텍스 레이스 없음 -> 안전. 위 isConnected 가드로 블록 위험도 제거.)
-  xTaskCreatePinnedToCore(audioTask, "audio", 8192, NULL, 2, NULL, 1);
+  // 디코더 core 0 (원래 설계, 영상 매끄러움). v11에서 core1 이동은 뽂뽂에 무효 확인 -> 되돌림.
+  xTaskCreatePinnedToCore(audioTask, "audio", 8192, NULL, 2, NULL, 0);
 
   if (songCount > 0) { buildShuffle(); g_reqIndex = shuffleOrder[0]; }
   else if (oledOK) { display.clearDisplay(); display.setCursor(0,0);
