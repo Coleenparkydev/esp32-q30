@@ -1,13 +1,17 @@
 /*
  * LoRa32 T3 MP3 player -> Soundcore Life Q30 (A2DP) + OLED 뮤직비디오
  *
- * ★ v3 — 곡 전환 재설계 (뽁뢱/전환실패 근본 해결)
- *   문제였던 것: 곡 전환을 loop(코어1)에서 g_songChanged로 요청 -> audioTask(코어0)가
- *     setPath+버퍼리셋. 이 '크로스코어 + 스트리밍 중 파이프라인 교체'가 A2DP 소스의
- *     fresh 상태를 깨서 전환 후 뽁뢱/정지가 났다. (첫 곡만 깨끗했던 이유 = 연결 직후 fresh)
- *   해결(라이브러리 정석): 전환을 오디오와 '같은 태스크(코어0)'에서 player.setIndex()로만
- *     처리하고, 라이브러리의 setSilenceOnInactive(true)로 전환 갭에 무음을 채워 A2DP
- *     스트림을 끊기지 않게 유지. loop은 영상/UI 전담 + 전환 '요청'만 넘긴다.
+ * ★ v4 — A2DPStream 정석 아키텍처 (뽁뢱 근본 해결)
+ *   지난 문제: 직접 BluetoothA2DPSource + get_data + BufferRTOS 를 손으로 굴렸다.
+ *     곡 전환 때 이 수제 파이프라인이 A2DP 소스를 흔들어 스트림이 정지(suspend)->뽁뢱.
+ *     (첫 곡만 깨끗했던 이유 = 연결 직후 fresh 상태)
+ *   해결: 라이브러리 메인테이너(pschatzmann, discussion #998)가 지정한 정석 =
+ *     AudioPlayer 의 출력을 A2DPStream 으로 두고 silence_on_nodata=true.
+ *     -> 전환 갭에도 A2DP 콜백이 무음을 흘려보내서 스트림이 절대 안 끊긴다 = 팝 방지.
+ *     + player.setAutoFade(true) 로 곡 경계 페이드(클릭 제거).
+ *     + source.setTimeoutAutoNext(1200): 예전 30000이 원인이라 다음 곡이 안 넘어갔음
+ *       (EOF 후 active가 30초 뒤에나 꺼짐). 1.2s로 줄여 자동 넘김 정상화.
+ *   비디오 싱크: CountingOutput 이 A2DPStream 으로 보내는 바이트를 세서 재생위치로 사용.
  */
 #include <SPI.h>
 #include <SD.h>
@@ -29,7 +33,6 @@ const char* BT_DEVICE_NAME = "Soundcore Life Q30";
 #define JOY_Y   34
 #define JOY_SW   4
 #define MAX_SONGS 150
-#define LIMIT_PCT 100
 
 // ---------- VIDEO ----------
 #define OLED_ADDR       0x3C
@@ -41,16 +44,40 @@ static const uint32_t SYNC_OFFSET_BYTES = (AUDIO_BPS * SYNC_OFFSET_MS) / 1000;
 static const uint16_t FRAME_BYTES = 1024;
 // ------------------------------
 
-static const int16_t SAFE_LIMIT = (int16_t)(32767L * LIMIT_PCT / 100);
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 bool oledOK = false;
 
+// ---- video clock (오디오태스크가 A2DP로 보낸 바이트 = 재생 위치) ----
+volatile uint32_t g_bytesPlayed = 0;
+volatile uint32_t g_wroteBytes  = 0;          // STAT용: 실제로 흘러간 오디오 바이트
+static portMUX_TYPE clkMux = portMUX_INITIALIZER_UNLOCKED;
+
+// ============================================================
+//  오디오 파이프라인 (라이브러리 정석: source -> player -> A2DPStream)
+// ============================================================
 AudioSourceSD source("/", ".mp3", SD_CS);
 MP3DecoderHelix decoder;
-BufferRTOS<uint8_t> a2dpBuffer(0);
-QueueStream<uint8_t> out(a2dpBuffer);
-AudioPlayer player(source, out, decoder);
-BluetoothA2DPSource a2dp;
+A2DPStream a2dp_out;                           // 플레이어 최종 출력 = A2DP 소스
+
+// A2DPStream 으로 나가는 바이트를 세서 비디오 싱크에 쓰는 얇은 래퍼
+class CountingOutput : public AudioOutput {
+ public:
+  size_t write(const uint8_t* data, size_t len) override {
+    size_t w = a2dp_out.write(data, len);      // 버퍼 가득차면 블로킹 = 실시간 속도조절
+    portENTER_CRITICAL(&clkMux);
+    g_bytesPlayed += (uint32_t)w;
+    g_wroteBytes  += (uint32_t)w;
+    portEXIT_CRITICAL(&clkMux);
+    return w;
+  }
+  int availableForWrite() override { return a2dp_out.availableForWrite(); }
+  void setAudioInfo(AudioInfo info) override {
+    AudioOutput::setAudioInfo(info);
+    a2dp_out.setAudioInfo(info);
+  }
+};
+CountingOutput counter;
+AudioPlayer player(source, counter, decoder);
 
 String songs[MAX_SONGS];
 int songCount = 0;
@@ -63,39 +90,16 @@ int cursor = 0;
 volatile int nowPlaying = -1;                 // audioTask -> loop (현재 곡 인덱스)
 uint32_t lastMove = 0, lastActivity = 0;
 
-// ---- video clock ----
-volatile uint32_t g_bytesPlayed = 0;          // A2DP 소비 바이트 = 재생 위치
-static portMUX_TYPE clkMux = portMUX_INITIALIZER_UNLOCKED;
 File     videoFile;
 uint32_t videoFrameCount = 0;
 int32_t  lastVideoFrame = -1;
 
-// ---- light 계측 (STAT 로그용) ----
-volatile uint32_t g_underruns = 0;
-volatile uint32_t g_getCalls  = 0;
-
 // ---- 코어 간 공유 ----
 SemaphoreHandle_t sdMutex;
-volatile bool     g_audioActive    = false;   // audioTask -> loop
-volatile int      g_reqIndex       = -1;      // loop -> audioTask: 이 곡으로 전환 요청
+volatile bool     g_audioActive     = false;  // audioTask -> loop
+volatile int      g_reqIndex        = -1;     // loop -> audioTask: 이 곡으로 전환 요청
 volatile int      g_videoPendingIdx = -1;     // audioTask -> loop: 이 곡 영상 열어라
 volatile uint32_t g_videoPendingAt  = 0;
-
-int32_t get_data(uint8_t* d, int32_t n) {
-  g_getCalls++;
-  int32_t got = a2dpBuffer.readArray(d, n);
-  portENTER_CRITICAL(&clkMux);
-  g_bytesPlayed += (uint32_t)got;             // 실제 소비 바이트만 카운트
-  portEXIT_CRITICAL(&clkMux);
-  if (got < n) { g_underruns++; memset(d + got, 0, (size_t)(n - got)); }
-  int16_t* s = (int16_t*)d;
-  int count = got / 2;
-  for (int i = 0; i < count; i++) {
-    if (s[i] >  SAFE_LIMIT) s[i] =  SAFE_LIMIT;
-    else if (s[i] < -SAFE_LIMIT) s[i] = -SAFE_LIMIT;
-  }
-  return n;
-}
 
 String cleanTitle(const String& raw) {
   String s = raw;
@@ -161,47 +165,49 @@ void announceSong(int idx) {
   portENTER_CRITICAL(&clkMux);
   g_bytesPlayed = 0;
   portEXIT_CRITICAL(&clkMux);
-  g_videoPendingIdx = idx;                     // 코어1이 살짝 뒤에 영상 오픈(전환순간 코어1 한가하게)
+  g_videoPendingIdx = idx;                     // 코어1이 살짝 뒤에 영상 오픈
   g_videoPendingAt  = millis() + 250;
   Serial.printf("Playing[%d] %s\n", idx, songs[idx].c_str());
 }
 
 // ============================================================
 //  오디오 태스크 (코어0) — 디코딩 + 곡 전환을 '한 태스크에서' 처리
+//  전환은 player.setIndex() 뿐. A2DPStream 은 그대로 두면 무음이 계속 흘러 안 끊긴다.
 // ============================================================
 void audioTask(void* pv) {
   static uint32_t songStart = 0;
-  static bool     sawActive = false;
+  static bool     sawData   = false;
   for (;;) {
-    // (1) 전환 요청 처리 (부팅 첫 곡 + 조이스틱 수동선택). 같은 태스크에서 setIndex.
+    // (1) 전환 요청 처리 (부팅 첫 곡 + 조이스틱 수동선택)
     int req = g_reqIndex;
     if (req >= 0 && req < songCount) {
       g_reqIndex = -1;
       xSemaphoreTake(sdMutex, portMAX_DELAY);
-      player.setIndex(req);                     // 라이브러리 정석 전환 (버퍼리셋/end 수동호출 안 함)
+      player.setIndex(req);                     // A2DPStream 은 건드리지 않음 = 무음 유지
       xSemaphoreGive(sdMutex);
-      songStart = millis(); sawActive = false;
+      songStart = millis(); sawData = false;
       announceSong(req);
     }
 
-    // (2) 디코딩 (버퍼 채우기)
+    // (2) 디코딩 -> A2DP. copy()는 A2DP 버퍼가 가득이면 write에서 블로킹(실시간).
     xSemaphoreTake(sdMutex, portMAX_DELAY);
-    player.copy();
+    size_t n = player.copy();
     bool act = player.isActive();
     xSemaphoreGive(sdMutex);
     g_audioActive = act;
-    if (act) sawActive = true;
+    if (n > 0) sawData = true;
 
-    // (3) 진짜 곡 끝 -> 셔플 다음 곡 (연결됨 + 3초이상 재생됨 확인 -> 부팅/버퍼풀 오발 방지)
-    if (sawActive && !act && g_reqIndex < 0 &&
-        a2dp.is_connected() && millis() - songStart > 3000) {
+    // (3) 곡 끝 -> 셔플 다음 곡.
+    //     autonext=false 이므로 EOF 후 timeoutAutoNext(1.2s) 지나면 active=false 로 떨어짐.
+    if (sawData && !act && g_reqIndex < 0 &&
+        a2dp_out.isConnected() && millis() - songStart > 3000) {
       shufflePos++;
       if (shufflePos >= songCount) buildShuffle();
       int idx = shuffleOrder[shufflePos];
       xSemaphoreTake(sdMutex, portMAX_DELAY);
       player.setIndex(idx);
       xSemaphoreGive(sdMutex);
-      songStart = millis(); sawActive = false;
+      songStart = millis(); sawData = false;
       announceSong(idx);
     }
 
@@ -215,7 +221,7 @@ void drawPlayTitle() {
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.print(a2dp.is_connected() ? "Q30" : "...");
+  display.print(a2dp_out.isConnected() ? "Q30" : "...");
   display.setCursor(60, 0); display.print("SHUFFLE");
   display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
   display.setTextWrap(true);
@@ -229,7 +235,7 @@ void renderVideo() {
   if (!oledOK) return;
   if (!videoFile || videoFrameCount == 0) {
     static int lastT = -2; static bool lastC = false;
-    bool c = a2dp.is_connected();
+    bool c = a2dp_out.isConnected();
     if (nowPlaying != lastT || c != lastC) { drawPlayTitle(); lastT = nowPlaying; lastC = c; }
     return;
   }
@@ -268,7 +274,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== MP3 + OLED player (v3: in-task switching) ===");
+  Serial.println("\n\n=== MP3 + OLED player (v4: A2DPStream) ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
@@ -278,24 +284,30 @@ void setup() {
   Wire.beginTransmission(OLED_ADDR);
   if (Wire.endTransmission() == 0) oledOK = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
 
+  // SD 는 반드시 20MHz 로 먼저 마운트 (이미 마운트되면 source.begin()이 재마운트 안 함 -> 속도 유지)
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
   if (!SD.begin(SD_CS, SPI, 20000000)) Serial.println("SD mount failed");
   scanSongs();
 
   sdMutex = xSemaphoreCreateMutex();
 
-  a2dpBuffer.resize(20 * 1024);
-  out.begin(95);
+  // ---- A2DP 출력 (플레이어 sink) ----
+  // silence_on_nodata=true : 디코드 버퍼가 잠깐 비어도(=곡 전환 갭) A2DP 콜백이 무음을
+  //   내보내 스트림을 살아있게 유지 -> 2번째 곡부터 나던 뽁뢱의 근본 해결.
+  A2DPConfig cfg = a2dp_out.defaultConfig(TX_MODE);
+  cfg.name = BT_DEVICE_NAME;
+  cfg.silence_on_nodata = true;
+  cfg.auto_reconnect = true;
+  cfg.wait_for_connection = false;             // 연결 대기로 setup/loop 막지 않음 (UI 바로 살아남)
+  a2dp_out.setVolume(0.65);
+  a2dp_out.begin(cfg);
 
-  source.setTimeoutAutoNext(30000);            // ★ 연결 전(~20s) 버퍼풀로 곡 건너뛰는 오발 방지
-  player.setDelayIfOutputFull(0);
-  player.setVolume(0.70);
-  player.setSilenceOnInactive(true);           // ★ 전환/비활성 갭에 무음 -> A2DP 스트림 유지
-  player.setAutoNext(false);                   //   셔플 진행은 audioTask가 직접(진짜 EOF에서)
-  player.begin(0, false);
-
-  a2dp.set_data_callback(get_data);
-  a2dp.start(BT_DEVICE_NAME);
+  source.setTimeoutAutoNext(1200);             // ★ EOF 후 1.2s 뒤 active=false -> 다음 곡 (예전 30000이 버그)
+  player.setSilenceOnInactive(true);           // 갭 동안 무음 (2차 안전망)
+  player.setVolume(1.0);                        // 실제 볼륨은 A2DP 단(0.65)에서
+  player.begin(-1, false);                      // 비활성 시작; 첫 곡은 g_reqIndex 로 요청
+  player.setAutoFade(true);                     // 전환 페이드 = 클릭/팝 제거
+  player.setAutoNext(false);                    // ★ begin()이 소스값으로 덮으므로 뒤에서 off (셔플 직접관리)
 
   xTaskCreatePinnedToCore(audioTask, "audio", 8192, NULL, 2, NULL, 0);
 
@@ -313,14 +325,14 @@ void loop() {
     uint32_t nowS = millis();
     if (nowS - statT > 2000) {
       statT = nowS;
-      uint32_t ur = g_underruns, gc = g_getCalls; g_underruns = 0; g_getCalls = 0;
-      Serial.printf("[STAT] UR=%u calls=%u conn=%d act=%d np=%d buf=%u pos=%.1fs\n",
-                    ur, gc, (int)a2dp.is_connected(), (int)g_audioActive, nowPlaying,
-                    (uint32_t)a2dpBuffer.available(), g_bytesPlayed / (float)AUDIO_BPS);
+      uint32_t wb; portENTER_CRITICAL(&clkMux); wb = g_wroteBytes; g_wroteBytes = 0; portEXIT_CRITICAL(&clkMux);
+      Serial.printf("[STAT] conn=%d act=%d np=%d wrote=%uB bufFree=%d pos=%.1fs\n",
+                    (int)a2dp_out.isConnected(), (int)g_audioActive, nowPlaying,
+                    wb, a2dp_out.availableForWrite(), g_bytesPlayed / (float)AUDIO_BPS);
     }
   }
 
-  // audioTask가 곡을 바꿨으면 영상 오픈 (전환순간 지나 코어1이 한가할 때)
+  // audioTask가 곡을 바꿨으면 영상 오픈
   if (g_videoPendingIdx >= 0 && (int32_t)(millis() - g_videoPendingAt) >= 0) {
     int v = g_videoPendingIdx; g_videoPendingIdx = -1;
     openVideoFor(v);
