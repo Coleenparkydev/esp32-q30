@@ -83,11 +83,15 @@ SemaphoreHandle_t sdMutex;
 volatile bool     g_songChanged = false;
 volatile int      g_requestSong = -1;
 volatile bool     g_audioActive = false;
+volatile bool     g_switching   = false;   // 전환 중엔 get_data 를 무음으로 -> end/reset 레이스 차단
 
 // ============================================================
 //  A2DP 데이터 콜백 (BT 스택이 PCM 을 pull) — 이 pull 모델이 v2에서 소리를 냈다.
 // ============================================================
 int32_t get_data(uint8_t* d, int32_t n) {
+  // ★ 전환 중이면 버퍼를 절대 건드리지 않고 무음만 반환 -> audioTask 의 end()/reset() 과
+  //   이 콜백이 동시에 a2dpBuffer 를 만지는 레이스(=데드락/오염)를 원천 차단.
+  if (g_switching) { memset(d, 0, (size_t)n); return n; }
   int32_t got = a2dpBuffer.readArray(d, n);
   portENTER_CRITICAL(&clkMux);
   g_bytesPlayed += (uint32_t)got;       // 마스터 시계 = 실제로 흘려보낸 바이트만
@@ -187,16 +191,22 @@ void audioTask(void* pv) {
       g_songChanged = false;
       int idx = g_requestSong;
       if (idx >= 0 && idx < songCount) {
+        // ★ 전환 프로토콜: get_data 를 먼저 무음으로 세운 뒤(레이스 차단) 깨끗이 정리.
+        //   이렇게 하면 end()/reset() 를 안전하게 부를 수 있어 데드락 없이도
+        //   이전 곡 디코더/스트림/버퍼가 완전히 리셋됨 -> "틀수록 이상해짐" 누적 오염 해결.
+        g_switching = true;
+        vTaskDelay(pdMS_TO_TICKS(8));          // 진행 중이던 get_data 콜이 빠져나갈 시간
         xSemaphoreTake(sdMutex, portMAX_DELAY);
-        // ★ FIX12: player.end()/a2dpBuffer.reset() 는 get_data 콜백과 레이스->데드락.
-        //   전환은 setPath 만. 버퍼는 flush 하지 않고 새 곡 PCM 이 자연히 밀어냄.
+        player.end();                          // 이전 곡 스트림/디코더 정리 (누수/오염 방지)
+        a2dpBuffer.reset();                    // 이전 곡 PCM flush
         portENTER_CRITICAL(&clkMux);
         g_bytesPlayed = 0;                     // 시계=0 을 새 곡에 정렬 (영상 리셋)
         portEXIT_CRITICAL(&clkMux);
         bool ok = player.setPath(songs[idx].c_str());
-        // ★ FIX5: 전환 직후 버퍼 프리필 -> 2번째 곡도 쿠션 갖고 시작(언더런 팝 방지)
+        // ★ FIX5: 전환 직후 버퍼 프리필 -> 2번째 곡도 쿠션 갖고 시작(언더런 렉 방지)
         for (int i = 0; i < 24 && player.isActive(); i++) player.copy();
         xSemaphoreGive(sdMutex);
+        g_switching = false;                   // get_data 재개
         Serial.printf("Playing[%d] %s -> %s\n", idx, songs[idx].c_str(), ok ? "OK" : "FAIL");
         if (!ok) vTaskDelay(pdMS_TO_TICKS(500));
       }
