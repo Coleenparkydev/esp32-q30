@@ -24,7 +24,10 @@
 // ---------- SETTINGS ----------
 // ★ 진단 토글: 1 = SD/디코더 우회하고 440Hz 사인톤을 A2DP로 직접. 삐- 들리면 링크정상.
 //   0 = 실제 재생(정상). setActive 버그 고쳤으니 0 으로 빌드/테스트.
-#define AUDIO_SELFTEST 1
+#define AUDIO_SELFTEST 0
+// ★ 대조실험: 0 = 영상 SD 읽기 끔(제목만 표시). 사용자 증언 "MP3 전용일 땐 뽂뽂 없었음" 재현용.
+//   조이스틱/오디오는 그대로 둔다 -> 뽂뽂이 사라지면 범인은 영상(SD 인터리브), 남으면 영상 무죄.
+#define VIDEO_ENABLE 1
 const char* BT_DEVICE_NAME = "Soundcore Life Q30";
 #define SD_CS   13
 #define SD_SCK  14
@@ -111,6 +114,11 @@ uint32_t lastMove = 0, lastActivity = 0;
 File     videoFile;
 uint32_t videoFrameCount = 0;
 int32_t  lastVideoFrame = -1;
+// v22: 영상 프레임 배치 버퍼 (SD 인터리브 완화). 힙이 빠듯해 4프레임=4KB 만.
+#define VIDEO_BATCH 4
+static uint8_t vbuf[VIDEO_BATCH * FRAME_BYTES];
+uint32_t vbufStart = 0xFFFFFFFF;   // vbuf 에 담긴 첫 프레임 번호
+uint32_t vbufCount = 0;
 
 // ---- 코어 간 공유 ----
 SemaphoreHandle_t sdMutex;
@@ -166,6 +174,7 @@ void openVideoFor(int idx) {
   if (idx < 0 || idx >= songCount) return;
   videoFrameCount = 0;
   lastVideoFrame  = -1;
+  vbufStart = 0xFFFFFFFF; vbufCount = 0;   // 곡 바뀌면 배치 캐시 무효
   String vp = videoPathFor(songs[idx]);
   xSemaphoreTake(sdMutex, portMAX_DELAY);
   if (videoFile) videoFile.close();
@@ -297,6 +306,14 @@ void drawPlayTitle() {
 
 void renderVideo() {
   if (!oledOK) return;
+#if !VIDEO_ENABLE
+  {  // 영상 끔: SD 안 읽고 제목만
+    static int lastT = -2; static bool lastC = false;
+    bool c = a2dp_out.isConnected();
+    if (nowPlaying != lastT || c != lastC) { drawPlayTitle(); lastT = nowPlaying; lastC = c; }
+    return;
+  }
+#endif
   if (!videoFile || videoFrameCount == 0) {
     static int lastT = -2; static bool lastC = false;
     bool c = a2dp_out.isConnected();
@@ -307,18 +324,32 @@ void renderVideo() {
   uint32_t tf = (bp > SYNC_OFFSET_BYTES) ? (bp - SYNC_OFFSET_BYTES) / BYTES_PER_FRAME : 0;
   if (tf >= videoFrameCount) tf = videoFrameCount - 1;
   if ((int32_t)tf == lastVideoFrame) return;
-  // (v13 의 '오디오 우선 SD 스킵'은 오디오 개선 0 + 영상만 끊김 -> 제거.
-  //  = SD 경합이 뽂뽂 원인이 아님을 실증했음.)
-  if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
-  uint32_t tv0 = millis();
-  videoFile.seek((uint32_t)tf * FRAME_BYTES);
-  int r = videoFile.read(display.getBuffer(), FRAME_BYTES);
-  uint32_t tvd = millis() - tv0;
-  xSemaphoreGive(sdMutex);
-  portENTER_CRITICAL(&clkMux);
-  if (tvd > g_maxVidMs) g_maxVidMs = tvd;      // 코어1이 mutex 쥐고 SD 읽은 시간
-  portEXIT_CRITICAL(&clkMux);
-  if (r == (int)FRAME_BYTES) display.display();
+
+  // ★ v22 — 뽂뽂의 원인: 초당 12번 MP3파일<->영상파일을 오가며 매 프레임 seek.
+  //   SD 카드는 두 파일 인터리브 접근에 취약(카드 read-ahead 캐시가 매번 무효화됨)
+  //   -> 바로 다음 MP3 읽기가 수십 ms 로 느려짐 -> A2DP 87ms 버퍼 굶음 -> 무음 삽입 = 뽂.
+  //   근거: 사용자 대조실험(MP3+조이스틱 전용 = 뽂뽂 없음, 영상 추가 = 뽂뽂) + esp32.com t=6075.
+  //   대책: 프레임을 batch 로 한 번에 순차 읽어 RAM 에 두고 거기서 꺼낸다.
+  //   -> SD 파일 전환 12회/초 -> 3회/초. 연속 프레임이면 seek 자체를 안 한다.
+  if (!(tf >= vbufStart && tf < vbufStart + vbufCount)) {
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+    uint32_t tv0 = millis();
+    uint32_t want = videoFrameCount - tf; if (want > VIDEO_BATCH) want = VIDEO_BATCH;
+    // 이미 그 위치면 seek 생략 = 순차 읽기 유지(카드 캐시 보존)
+    if (videoFile.position() != (uint32_t)tf * FRAME_BYTES)
+      videoFile.seek((uint32_t)tf * FRAME_BYTES);
+    int r = videoFile.read(vbuf, want * FRAME_BYTES);
+    uint32_t tvd = millis() - tv0;
+    xSemaphoreGive(sdMutex);
+    portENTER_CRITICAL(&clkMux);
+    if (tvd > g_maxVidMs) g_maxVidMs = tvd;
+    portEXIT_CRITICAL(&clkMux);
+    if (r <= 0) return;
+    vbufStart = tf; vbufCount = (uint32_t)r / FRAME_BYTES;
+    if (vbufCount == 0) return;
+  }
+  memcpy(display.getBuffer(), vbuf + (tf - vbufStart) * FRAME_BYTES, FRAME_BYTES);
+  display.display();
   lastVideoFrame = (int32_t)tf;
 }
 
@@ -345,7 +376,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== SELFTEST: 440Hz sine direct to A2DP (no SD, no decoder, no player) ===");
+  Serial.println("\n\n=== v22: batched video reads (fix SD interleave -> popping) ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
