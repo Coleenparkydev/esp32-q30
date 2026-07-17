@@ -358,7 +358,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== v23: setBufferSize(256) - raise buffer margin 45ms -> 76ms ===");
+  Serial.println("\n\n=== v24 MEASURE: does the A2DP buffer actually run empty? ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
@@ -396,13 +396,8 @@ void setup() {
   //   예전 pull-model 코드엔 이미 setDelayIfOutputFull(0) 이 있었는데 재작성하며 유실됨.
   //   0 = 대기 안 함. 속도조절은 A2DPStream::write() 가 블로킹으로 해주므로 폭주하지 않는다.
   player.setDelayIfOutputFull(0);
-  // ★★ v23 — 여유(margin) 키우기. RAM 추가 0.
-  //   기본 청크 1024B(MP3) = 42.7ms 분량 -> 디코딩하면 PCM 7.5KB 를 한 번에 쏟아붓는다.
-  //   A2DPStream::write 는 7.5KB 자리가 날 때까지 기다리므로 버퍼는 87ms <-> 45ms 로 진동.
-  //   = 다음 청크를 45ms 안에 못 읽으면 바닥 -> 무음 삽입 = 뽂.
-  //   256B 로 줄이면 PCM 1.9KB -> 버퍼 최저점이 76ms 로 올라가 SD 지연을 훨씬 잘 흡수한다.
-  //   근거: 사용자 대조실험(MP3 전용=무결점, 영상 추가=뽂뽂) -> 영상 seek 이 SD 지연 유발.
-  player.setBufferSize(256);
+  // (v23 setBufferSize(256) 철회: 출력 덩어리는 디코더 프레임(4608B)이 정하므로 무효.
+  //  MP3DecoderHelix.h:139 provideResult() 가 outputSamps 를 한 번에 write 한다.)
   player.setSilenceOnInactive(true);
   player.setVolume(1.0);
   player.begin(-1, false);                      // 비활성 시작; 첫 곡은 g_reqIndex 로 요청
