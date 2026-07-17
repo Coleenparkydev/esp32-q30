@@ -27,7 +27,7 @@
 #define AUDIO_SELFTEST 0
 // ★ 대조실험: 0 = 영상 SD 읽기 끔(제목만 표시). 사용자 증언 "MP3 전용일 땐 뽂뽂 없었음" 재현용.
 //   조이스틱/오디오는 그대로 둔다 -> 뽂뽂이 사라지면 범인은 영상(SD 인터리브), 남으면 영상 무죄.
-#define VIDEO_ENABLE 1
+#define VIDEO_ENABLE 0
 const char* BT_DEVICE_NAME = "Soundcore Life Q30";
 #define SD_CS   13
 #define SD_SCK  14
@@ -358,7 +358,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== v24 MEASURE: does the A2DP buffer actually run empty? ===");
+  Serial.println("\n\n=== v25 CONTROL: VIDEO_ENABLE=0 (same fw, video off) ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
