@@ -27,7 +27,7 @@
 #define AUDIO_SELFTEST 0
 // ★ 대조실험: 0 = 영상 SD 읽기 끔(제목만 표시). 사용자 증언 "MP3 전용일 땐 뽂뽂 없었음" 재현용.
 //   조이스틱/오디오는 그대로 둔다 -> 뽂뽂이 사라지면 범인은 영상(SD 인터리브), 남으면 영상 무죄.
-#define VIDEO_ENABLE 0
+#define VIDEO_ENABLE 1
 const char* BT_DEVICE_NAME = "Soundcore Life Q30";
 #define SD_CS   13
 #define SD_SCK  14
@@ -358,7 +358,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== v25 CONTROL: VIDEO_ENABLE=0 (same fw, video off) ===");
+  Serial.println("\n\n=== v27: player.setVolume(0.70) - match the known-good MP3 player ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
@@ -399,7 +399,14 @@ void setup() {
   // (v23 setBufferSize(256) 철회: 출력 덩어리는 디코더 프레임(4608B)이 정하므로 무효.
   //  MP3DecoderHelix.h:139 provideResult() 가 outputSamps 를 한 번에 write 한다.)
   player.setSilenceOnInactive(true);
-  player.setVolume(1.0);
+  // ★★ v27 — 예전 '뽂뽂 없던' MP3 전용 코드(esp32-mp3-player.ino:176)는 0.70 이었다.
+  //   재작성하며 내가 1.0 으로 올린 것. player.setVolume 은 VolumeStream 이 PCM 을 실제로
+  //   곱하는 값이라 1.0 = 헤드룸 0 = 풀스케일로 SBC 인코더에 밀어넣는 것.
+  //   (a2dp_out.setVolume 은 AVRCP 로 Q30 볼륨만 바꿀 뿐 PCM 엔 손 안 댐 — A2DPStream.h:301)
+  //   측정: 버퍼는 절대 안 빔(maxAvailW=4608, empty=0) -> 타이밍이 아니라 '내용물' 문제.
+  //   메커니즘(풀스케일 -> SBC 오버슈트/클리핑)은 검색으로 확증 못 했으나,
+  //   같은 하드웨어에서 0.70=무결점 / 1.0=뽂뽂 이라는 경험적 차이가 오늘 가장 강한 증거.
+  player.setVolume(0.70);
   player.begin(-1, false);                      // 비활성 시작; 첫 곡은 g_reqIndex 로 요청
   player.setAutoNext(false);                    // begin()이 소스값으로 덮으므로 뒤에서 off
 
