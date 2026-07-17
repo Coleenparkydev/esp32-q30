@@ -83,6 +83,10 @@ volatile uint32_t g_padEvents  = 0;           // zero-pad 가 발생한 콜백 �
 volatile uint32_t g_padBytes   = 0;           // pad 로 채운 총 바이트
 volatile uint32_t g_cbMaxGapMs = 0;           // 콜백 호출 간 최장 공백 (>50ms 면 미디어태스크가 굶었다 = stall)
 volatile uint32_t g_cbLastMs   = 0;
+// ---- v31: 시리얼 없이 OLED 로 읽는 부팅 후 누적 진단 (리셋 안 됨) ----
+volatile uint32_t g_padTotal   = 0;           // 부팅 후 pad 사건 총합 (P 숫자)
+volatile uint32_t g_cbGapWorst = 0;           // 부팅 후 최악 콜백 공백 ms (G 숫자)
+volatile uint32_t g_largestMin = 0xFFFFFFFF;  // 부팅 후 힙 최대연속블록 최저치 (F 숫자)
 // 기존 파이프라인 타이밍 계측 (유지)
 volatile uint32_t g_maxWriteMs = 0;           // 링버퍼 write 가 블록된 최장 시간
 volatile uint32_t g_maxGapMs   = 0;           // copy() 호출 간 최장 공백
@@ -108,8 +112,9 @@ int32_t btGetData(uint8_t* data, int32_t len) {
   if (got < len) memset(data + got, 0, len - got);
   portENTER_CRITICAL(&clkMux);
   if (avail < g_cbMinAvail) g_cbMinAvail = avail;
-  if (got < len) { g_padEvents++; g_padBytes += (uint32_t)(len - got); }
+  if (got < len) { g_padEvents++; g_padTotal++; g_padBytes += (uint32_t)(len - got); }
   if (g_cbLastMs && now - g_cbLastMs > g_cbMaxGapMs) g_cbMaxGapMs = now - g_cbLastMs;
+  if (g_cbMaxGapMs > g_cbGapWorst) g_cbGapWorst = g_cbMaxGapMs;
   g_cbLastMs = now;
   portEXIT_CRITICAL(&clkMux);
   return len;                                 // bluedroid 는 부족을 영원히 모른다
@@ -223,6 +228,9 @@ void announceSong(int idx) {
   portEXIT_CRITICAL(&clkMux);
   g_videoPendingIdx = idx;
   g_videoPendingAt  = millis() + 250;
+  // 전환 직후 = 디코더 realloc 직후 -> 단편화 최악 순간을 여기서도 샘플링
+  uint32_t lb = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  if (lb < g_largestMin) g_largestMin = lb;
   Serial.printf("Playing[%d] %s\n", idx, songs[idx].c_str());
 }
 
@@ -315,7 +323,10 @@ void drawPlayTitle() {
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.print(a2dp.is_connected() ? "Q30" : "...");
-  display.setCursor(60, 0); display.print("SHUFFLE");
+  // v31: SHUFFLE 대신 누적 진단 — P=pad사건 G=최악콜백공백ms F=힙최대블록최저(KB)
+  display.setCursor(44, 0);
+  display.printf("P%u G%u F%uk", g_padTotal, g_cbGapWorst,
+                 (g_largestMin == 0xFFFFFFFF ? 0 : g_largestMin / 1024));
   display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
   display.setTextWrap(true);
   display.setCursor(0, 18);
@@ -356,7 +367,15 @@ void renderVideo() {
   portENTER_CRITICAL(&clkMux);
   if (tvd > g_maxVidMs) g_maxVidMs = tvd;
   portEXIT_CRITICAL(&clkMux);
-  if (r == (int)FRAME_BYTES) display.display();
+  if (r == (int)FRAME_BYTES) {
+    // v31: 영상 위 진단 오버레이 (시리얼 없이 판독용) — 해결되면 제거
+    display.setCursor(0, 0);
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    display.printf("P%u G%u F%uk", g_padTotal, g_cbGapWorst,
+                   (g_largestMin == 0xFFFFFFFF ? 0 : g_largestMin / 1024));
+    display.display();
+  }
   lastVideoFrame = (int32_t)tf;
 }
 
@@ -383,7 +402,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== v30-fable: raw A2DP + zero-pad get_data (no lib volume) ===");
+  Serial.println("\n\n=== v31-fable: v30 + OLED diag overlay (P/G/F, no serial needed) ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
@@ -450,10 +469,11 @@ void loop() {
       portEXIT_CRITICAL(&clkMux);
       // pad>0 = 콜백이 무음을 채웠다(=예전 같으면 bluedroid underflow 사건).
       // 뽁이 들린 순간과 pad/cbGap 이 같이 뛰면 소스 쪽, 둘 다 0인데 뽁이면 RF/헤드폰 쪽.
+      uint32_t lb = (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+      if (lb < g_largestMin) g_largestMin = lb;
       Serial.printf("[STAT] np=%d wrote=%uB pos=%.1fs heap=%u largest=%u | ringMin=%d/%d pad=%u/%uB cbGap=%ums | gap=%ums mutex=%ums copy=%ums wr=%ums vid=%ums\n",
                     nowPlaying, wb, g_bytesPlayed / (float)AUDIO_BPS,
-                    ESP.getFreeHeap(),
-                    (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                    ESP.getFreeHeap(), lb,
                     mn, RING_SIZE, pe, pb, cg, mg, mm, mc, mw, mv);
     }
   }
