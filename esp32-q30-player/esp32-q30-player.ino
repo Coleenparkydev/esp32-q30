@@ -1,6 +1,11 @@
 /*
  * LoRa32 T3 MP3 player -> Soundcore Life Q30 (A2DP) + OLED 뮤직비디오
  *
+ * ★ v33 — v32 실측: P0 G28 F0k + 0.5s 주기 렉. 링 30KB(+15KB)가 힙을 고갈시켜
+ *   bluedroid 패킷 할당 실패(리듬 렉) 유발 → 링 87ms/오프셋 180 원복. P0 증명:
+ *   87ms 링은 안 뚫린다(underrun 가설 기각). 지속 디코더는 유지 = v30 대비
+ *   단일 변수 실험. F 는 실시간 값으로 변경(부팅최저치는 부팅 딥과 구별 불가).
+ *
  * ★ v32 — v30 이후에도 뽂뽂 지속 → 남은 소스측 원인 2개 제거:
  *   (A) 곡 전환마다 helix 디코더 free/malloc(≈29KB) → 힙 단편화 → bluedroid 가
  *       패킷 버퍼 할당 실패 시 조용히 드랍 = 링 무결(P=0)인데도 뽂. (PersistentHelix)
@@ -63,13 +68,13 @@ const char* BT_DEVICE_NAME = "Soundcore Life Q30";
 #define JOY_Y   34
 #define JOY_SW   4
 #define MAX_SONGS 150
-#define RING_SIZE 30720            // ★v32 174ms @44100/16/2ch — SD 읽기 지연 스파이크(카드 내부 GC, 수백ms급)가 87ms 링을 뚫고 underrun 내는 것 방지
+#define RING_SIZE 15360            // ★v33 87ms 로 원복. 30KB 실험 결과: P=0(링은 87ms 로도 안 뚫림)인데 F0k + 0.5s 주기 렉 = +15KB 가 힙을 고갈시켜 bluedroid 패킷 할당 실패 유발. 링 증설 금지.
 
 // ---------- VIDEO ----------
 #define OLED_ADDR       0x3C
 #define VIDEO_FPS       12
 #define AUDIO_BPS       (44100UL * 2 * 2)
-#define SYNC_OFFSET_MS  267        // ★v32 180+87: 링 2배 → 영상시계(링에 쓴 바이트)의 실제 재생 대비 선행이 87ms 늘어난 만큼 보정
+#define SYNC_OFFSET_MS  180        // ★v33 링 87ms 원복에 맞춰 복귀
 static const uint32_t BYTES_PER_FRAME   = AUDIO_BPS / VIDEO_FPS;
 static const uint32_t SYNC_OFFSET_BYTES = (AUDIO_BPS * SYNC_OFFSET_MS) / 1000;
 static const uint16_t FRAME_BYTES = 1024;
@@ -360,10 +365,11 @@ void drawPlayTitle() {
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.print(a2dp.is_connected() ? "Q30" : "...");
-  // v31: SHUFFLE 대신 누적 진단 — P=pad사건 G=최악콜백공백ms F=힙최대블록최저(KB)
+  // v33: F 는 '현재' 최대 연속블록(KB). (v31/32 의 부팅후최저치는 부팅 순간 딥에도
+  // 영원히 0k 로 남아 실시간 고갈과 구별 불가였음)
   display.setCursor(44, 0);
   display.printf("P%u G%u F%uk", g_padTotal, g_cbGapWorst,
-                 (g_largestMin == 0xFFFFFFFF ? 0 : g_largestMin / 1024));
+                 (uint32_t)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024));
   display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
   display.setTextWrap(true);
   display.setCursor(0, 18);
@@ -405,12 +411,12 @@ void renderVideo() {
   if (tvd > g_maxVidMs) g_maxVidMs = tvd;
   portEXIT_CRITICAL(&clkMux);
   if (r == (int)FRAME_BYTES) {
-    // v31: 영상 위 진단 오버레이 (시리얼 없이 판독용) — 해결되면 제거
+    // v31: 영상 위 진단 오버레이 (시리얼 없이 판독용) — 해결되면 제거. v33: F 는 현재값
     display.setCursor(0, 0);
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
     display.printf("P%u G%u F%uk", g_padTotal, g_cbGapWorst,
-                   (g_largestMin == 0xFFFFFFFF ? 0 : g_largestMin / 1024));
+                   (uint32_t)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024));
     display.display();
   }
   lastVideoFrame = (int32_t)tf;
@@ -439,7 +445,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== v32-fable: persistent helix (no per-song free/malloc) + 174ms ring + P/G/F overlay ===");
+  Serial.println("\n\n=== v33-fable: persistent helix + ring back to 87ms (30KB starved bluedroid) + live F ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
@@ -456,10 +462,7 @@ void setup() {
   sdMutex = xSemaphoreCreateMutex();
 
   // ---- 링버퍼 + A2DP 소스 직결 ----
-  if (!audioRing.resize(RING_SIZE)) {         // v32: 30KB 연속블록 실패 시 기존 용량으로 후퇴
-    Serial.println("ring 30KB alloc FAILED -> fallback 15360 (sync offset will be ~87ms early)");
-    audioRing.resize(15360);
-  }
+  if (!audioRing.resize(RING_SIZE)) Serial.println("ring alloc FAILED");
   audioRing.setReadMaxWait(0);                 // ★ 콜백은 절대 블록 금지 (v30 핵심 1)
   a2dp.set_volume_control(&noVolCtl);          // ★ 라이브러리 PCM 개입 봉인 (v30 핵심 2)
   a2dp.set_auto_reconnect(true);
