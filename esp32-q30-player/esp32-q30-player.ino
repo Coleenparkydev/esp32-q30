@@ -1,6 +1,12 @@
 /*
  * LoRa32 T3 MP3 player -> Soundcore Life Q30 (A2DP) + OLED 뮤직비디오
  *
+ * ★ v32 — v30 이후에도 뽂뽂 지속 → 남은 소스측 원인 2개 제거:
+ *   (A) 곡 전환마다 helix 디코더 free/malloc(≈29KB) → 힙 단편화 → bluedroid 가
+ *       패킷 버퍼 할당 실패 시 조용히 드랍 = 링 무결(P=0)인데도 뽂. (PersistentHelix)
+ *   (B) 링 87ms 는 SD 카드 내부 GC 지연 스파이크(수백 ms)를 못 버팀 → 174ms 로 증설,
+ *       영상 SYNC_OFFSET 180→267ms 보정. 여전히 나면 P/G/F 로 소스/RF 판별.
+ *
  * ★ v30 — A2DPStream 폐기, 직결 구조 복귀 + zero-pad 콜백 (뽂뽂 근본 수정 시도)
  *
  *   라이브러리 소스 정밀 분석(핀 버전: audio-tools v1.2.5 / ESP32-A2DP b559fb15 /
@@ -57,13 +63,13 @@ const char* BT_DEVICE_NAME = "Soundcore Life Q30";
 #define JOY_Y   34
 #define JOY_SW   4
 #define MAX_SONGS 150
-#define RING_SIZE 15360            // 87ms @44100/16/2ch (기존과 동일 용량)
+#define RING_SIZE 30720            // ★v32 174ms @44100/16/2ch — SD 읽기 지연 스파이크(카드 내부 GC, 수백ms급)가 87ms 링을 뚫고 underrun 내는 것 방지
 
 // ---------- VIDEO ----------
 #define OLED_ADDR       0x3C
 #define VIDEO_FPS       12
 #define AUDIO_BPS       (44100UL * 2 * 2)
-#define SYNC_OFFSET_MS  180
+#define SYNC_OFFSET_MS  267        // ★v32 180+87: 링 2배 → 영상시계(링에 쓴 바이트)의 실제 재생 대비 선행이 87ms 늘어난 만큼 보정
 static const uint32_t BYTES_PER_FRAME   = AUDIO_BPS / VIDEO_FPS;
 static const uint32_t SYNC_OFFSET_BYTES = (AUDIO_BPS * SYNC_OFFSET_MS) / 1000;
 static const uint16_t FRAME_BYTES = 1024;
@@ -95,10 +101,41 @@ volatile uint32_t g_maxCopyMs  = 0;           // player.copy() 자체가 걸린 
 volatile uint32_t g_maxVidMs   = 0;           // 코어1이 sdMutex 쥐고 영상 읽은 최장 시간
 
 // ============================================================
+//  ★v32 — 곡 전환마다 helix 디코더가 free/malloc(≈29KB) 되는 것 차단.
+//  AudioPlayer::setStream() -> end() 가 매 곡 p_decoder->end()/begin() 을 호출하고
+//  (AudioPlayer.h:231), libhelix end() 는 MP3FreeDecoder(≈23KB)+버퍼 2개를 해제한다.
+//  그 사이 bluedroid 가 20ms 마다 osi_malloc/free 를 하므로 곡을 넘길수록 힙이
+//  조각나고, 패킷 버퍼 할당 실패 시 bluedroid 는 '조용히' 프레임을 드랍한다
+//  = 링은 멀쩡(P=0)인데 뽂. "7곡쯤 넘기면 심해짐" 관측과 일치. F 숫자가 지표.
+// ============================================================
+class PersistentHelix : public libhelix::MP3DecoderHelix {
+ public:
+  // 메모리는 절대 해제하지 않고 스트림 상태만 리셋.
+  void end() override {
+    frame_buffer.reset();                     // 이전 곡 잔여 바이트 폐기 (free 아님)
+    frame_counter = 0;
+    active = false;                           // begin() 의 'if(active) end()' 재진입 차단
+    memset(&mp3FrameInfo, 0, sizeof(MP3FrameInfo));
+    // 원본과 달리 flush() 안 함(이전 곡 꼬리가 링에 섞이는 것 방지),
+    // MP3FreeDecoder 안 함. begin() 은 그대로 두면 됨: decoder 가 살아있으면
+    // MP3InitDecoder 재호출 없고(allocateDecoder), Vector::resize 는 동일
+    // 크기면 no-op → 곡 전환 시 재할당 0회.
+  }
+};
+class PersistentMP3Decoder : public audio_tools::MP3DecoderHelix {
+ public:
+  PersistentMP3Decoder() {
+    delete mp3;                               // 래퍼 기본 드라이버를 지속형으로 교체
+    mp3 = new PersistentHelix();
+    mp3->setReference(this);
+  }
+};
+
+// ============================================================
 //  오디오 파이프라인: source -> player -> CountingOutput -> audioRing -> BT 콜백
 // ============================================================
 AudioSourceSD source("/", ".mp3", SD_CS);
-MP3DecoderHelix decoder;
+PersistentMP3Decoder decoder;
 BluetoothA2DPSource a2dp;
 BufferRTOS<uint8_t> audioRing(0);             // setup 에서 resize + readWait=0
 A2DPNoVolumeControl noVolCtl;                 // 라이브러리 PCM 개입 봉인
@@ -402,7 +439,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== v31-fable: v30 + OLED diag overlay (P/G/F, no serial needed) ===");
+  Serial.println("\n\n=== v32-fable: persistent helix (no per-song free/malloc) + 174ms ring + P/G/F overlay ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
@@ -419,7 +456,10 @@ void setup() {
   sdMutex = xSemaphoreCreateMutex();
 
   // ---- 링버퍼 + A2DP 소스 직결 ----
-  audioRing.resize(RING_SIZE);
+  if (!audioRing.resize(RING_SIZE)) {         // v32: 30KB 연속블록 실패 시 기존 용량으로 후퇴
+    Serial.println("ring 30KB alloc FAILED -> fallback 15360 (sync offset will be ~87ms early)");
+    audioRing.resize(15360);
+  }
   audioRing.setReadMaxWait(0);                 // ★ 콜백은 절대 블록 금지 (v30 핵심 1)
   a2dp.set_volume_control(&noVolCtl);          // ★ 라이브러리 PCM 개입 봉인 (v30 핵심 2)
   a2dp.set_auto_reconnect(true);
