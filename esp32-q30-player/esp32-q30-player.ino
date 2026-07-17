@@ -114,11 +114,6 @@ uint32_t lastMove = 0, lastActivity = 0;
 File     videoFile;
 uint32_t videoFrameCount = 0;
 int32_t  lastVideoFrame = -1;
-// v22: 영상 프레임 배치 버퍼 (SD 인터리브 완화). 힙이 빠듯해 4프레임=4KB 만.
-#define VIDEO_BATCH 4
-static uint8_t vbuf[VIDEO_BATCH * FRAME_BYTES];
-uint32_t vbufStart = 0xFFFFFFFF;   // vbuf 에 담긴 첫 프레임 번호
-uint32_t vbufCount = 0;
 
 // ---- 코어 간 공유 ----
 SemaphoreHandle_t sdMutex;
@@ -174,7 +169,6 @@ void openVideoFor(int idx) {
   if (idx < 0 || idx >= songCount) return;
   videoFrameCount = 0;
   lastVideoFrame  = -1;
-  vbufStart = 0xFFFFFFFF; vbufCount = 0;   // 곡 바뀌면 배치 캐시 무효
   String vp = videoPathFor(songs[idx]);
   xSemaphoreTake(sdMutex, portMAX_DELAY);
   if (videoFile) videoFile.close();
@@ -325,31 +319,19 @@ void renderVideo() {
   if (tf >= videoFrameCount) tf = videoFrameCount - 1;
   if ((int32_t)tf == lastVideoFrame) return;
 
-  // ★ v22 — 뽂뽂의 원인: 초당 12번 MP3파일<->영상파일을 오가며 매 프레임 seek.
-  //   SD 카드는 두 파일 인터리브 접근에 취약(카드 read-ahead 캐시가 매번 무효화됨)
-  //   -> 바로 다음 MP3 읽기가 수십 ms 로 느려짐 -> A2DP 87ms 버퍼 굶음 -> 무음 삽입 = 뽂.
-  //   근거: 사용자 대조실험(MP3+조이스틱 전용 = 뽂뽂 없음, 영상 추가 = 뽂뽂) + esp32.com t=6075.
-  //   대책: 프레임을 batch 로 한 번에 순차 읽어 RAM 에 두고 거기서 꺼낸다.
-  //   -> SD 파일 전환 12회/초 -> 3회/초. 연속 프레임이면 seek 자체를 안 한다.
-  if (!(tf >= vbufStart && tf < vbufStart + vbufCount)) {
-    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
-    uint32_t tv0 = millis();
-    uint32_t want = videoFrameCount - tf; if (want > VIDEO_BATCH) want = VIDEO_BATCH;
-    // 이미 그 위치면 seek 생략 = 순차 읽기 유지(카드 캐시 보존)
-    if (videoFile.position() != (uint32_t)tf * FRAME_BYTES)
-      videoFile.seek((uint32_t)tf * FRAME_BYTES);
-    int r = videoFile.read(vbuf, want * FRAME_BYTES);
-    uint32_t tvd = millis() - tv0;
-    xSemaphoreGive(sdMutex);
-    portENTER_CRITICAL(&clkMux);
-    if (tvd > g_maxVidMs) g_maxVidMs = tvd;
-    portEXIT_CRITICAL(&clkMux);
-    if (r <= 0) return;
-    vbufStart = tf; vbufCount = (uint32_t)r / FRAME_BYTES;
-    if (vbufCount == 0) return;
-  }
-  memcpy(display.getBuffer(), vbuf + (tf - vbufStart) * FRAME_BYTES, FRAME_BYTES);
-  display.display();
+  // v22 배치읽기는 되돌림: mutex 점유가 7ms->28ms 로 커져 여유(45ms)를 오히려 깎을 위험.
+  // 다만 '이미 그 위치면 seek 생략'은 공짜이고 순차 read-ahead 를 보존하므로 유지.
+  if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+  uint32_t tv0 = millis();
+  if (videoFile.position() != (uint32_t)tf * FRAME_BYTES)
+    videoFile.seek((uint32_t)tf * FRAME_BYTES);
+  int r = videoFile.read(display.getBuffer(), FRAME_BYTES);
+  uint32_t tvd = millis() - tv0;
+  xSemaphoreGive(sdMutex);
+  portENTER_CRITICAL(&clkMux);
+  if (tvd > g_maxVidMs) g_maxVidMs = tvd;
+  portEXIT_CRITICAL(&clkMux);
+  if (r == (int)FRAME_BYTES) display.display();
   lastVideoFrame = (int32_t)tf;
 }
 
@@ -376,7 +358,7 @@ void drawList() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n\n=== v22: batched video reads (fix SD interleave -> popping) ===");
+  Serial.println("\n\n=== v23: setBufferSize(256) - raise buffer margin 45ms -> 76ms ===");
 
   pinMode(LORA_CS, OUTPUT); digitalWrite(LORA_CS, HIGH);
   pinMode(JOY_SW, INPUT_PULLUP);
@@ -414,6 +396,13 @@ void setup() {
   //   예전 pull-model 코드엔 이미 setDelayIfOutputFull(0) 이 있었는데 재작성하며 유실됨.
   //   0 = 대기 안 함. 속도조절은 A2DPStream::write() 가 블로킹으로 해주므로 폭주하지 않는다.
   player.setDelayIfOutputFull(0);
+  // ★★ v23 — 여유(margin) 키우기. RAM 추가 0.
+  //   기본 청크 1024B(MP3) = 42.7ms 분량 -> 디코딩하면 PCM 7.5KB 를 한 번에 쏟아붓는다.
+  //   A2DPStream::write 는 7.5KB 자리가 날 때까지 기다리므로 버퍼는 87ms <-> 45ms 로 진동.
+  //   = 다음 청크를 45ms 안에 못 읽으면 바닥 -> 무음 삽입 = 뽂.
+  //   256B 로 줄이면 PCM 1.9KB -> 버퍼 최저점이 76ms 로 올라가 SD 지연을 훨씬 잘 흡수한다.
+  //   근거: 사용자 대조실험(MP3 전용=무결점, 영상 추가=뽂뽂) -> 영상 seek 이 SD 지연 유발.
+  player.setBufferSize(256);
   player.setSilenceOnInactive(true);
   player.setVolume(1.0);
   player.begin(-1, false);                      // 비활성 시작; 첫 곡은 g_reqIndex 로 요청
